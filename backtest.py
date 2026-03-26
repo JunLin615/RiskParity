@@ -586,6 +586,10 @@ def calc_annual_return(nav: pd.Series, annualization: int = 252) -> float:
 def calc_annual_volatility(returns: pd.Series, annualization: int = 252) -> float:
     if len(returns.dropna()) < 2: return np.nan
     return float(returns.std(ddof=1) * np.sqrt(annualization))
+def calc_excess_return(nav: pd.Series, annualization: int = 252, risk_free_rate: float = 0.0) -> float:
+    if len(nav) < 2: return np.nan
+    n = len(nav) - 1
+    return float((nav.iloc[-1] / nav.iloc[0]) ** (annualization / n) - 1.0-risk_free_rate)
 
 def calc_sharpe_ratio(returns: pd.Series, risk_free_rate: float = 0.0, annualization: int = 252) -> float:
     ann_ret = float(returns.mean() * annualization)
@@ -597,16 +601,146 @@ def calc_max_drawdown(nav: pd.Series) -> float:
     dd = calc_drawdown(nav)
     if len(dd) == 0: return np.nan
     return float(dd.min())
-
+def calc_calmar_ratio(nav: pd.Series, annualization: int = 252) -> float:
+    max_drawdown = calc_max_drawdown(nav)
+    if not np.isfinite(max_drawdown) or len(nav) < 2: return np.nan
+    n = len(nav) - 1
+    return float(((nav.iloc[-1] / nav.iloc[0]) ** (annualization / n) - 1.0)/max_drawdown)
 def performance_summary(nav: pd.Series, returns: pd.Series, risk_free_rate: float = 0.0, annualization: int = 252) -> pd.Series:
     return pd.Series({
         "total_return": calc_total_return(nav),
         "annual_return": calc_annual_return(nav, annualization=annualization),
+        "excess_return":calc_excess_return(nav, annualization=annualization, risk_free_rate=risk_free_rate),
         "annual_volatility": calc_annual_volatility(returns, annualization=annualization),
         "sharpe_ratio": calc_sharpe_ratio(returns, risk_free_rate=risk_free_rate, annualization=annualization),
         "max_drawdown": calc_max_drawdown(nav),
+        "calmar_ratio": calc_calmar_ratio(nav, annualization=annualization),
     })
+def calc_asset_correlation_matrix(
+    prices: pd.DataFrame,
+    return_type: str = "log",
+    method: str = "pearson"
+) -> pd.DataFrame:
+    """
+    计算资产收益率的相关性矩阵。
+    
+    参数：
+    prices: 资产价格矩阵，index 为时间，columns 为资产代码
+    return_type: "simple" (简单收益率) 或 "log" (对数收益率，资产配置通常更推荐使用 log)
+    method: "pearson" (线性相关), "kendall", "spearman" (秩相关)
+    """
+    # 必须先进行前向填充，避免不同资产因停牌日不同导致计算 pct_change 时产生错位空洞
+    px = prices.ffill() 
+    
+    if return_type == "log":
+        rets = np.log(px / px.shift(1))
+    else:
+        rets = px.pct_change()
+        
+    return rets.corr(method=method)
 
+
+def calc_avg_pairwise_correlation(corr_matrix: pd.DataFrame) -> float:
+    """
+    计算平均两两相关系数（剔除对角线上的自身相关性 1.0）。
+    用于评估整个资产池的天然分散度。数值越低，说明资产互补性越强。
+    """
+    mat = corr_matrix.values
+    n = mat.shape[0]
+    if n < 2:
+        return np.nan
+    
+    # 提取上三角矩阵中的非对角线元素并求均值
+    upper_tri_elements = mat[np.triu_indices(n, k=1)]
+    return float(np.nanmean(upper_tri_elements))
+
+def calc_covariance_matrix(
+    prices: pd.DataFrame,
+    return_type: str = "log",
+    annualization: int = 252
+    ) -> pd.DataFrame:
+    """
+    计算基于历史价格的年化协方差矩阵。
+    """
+    px = prices.ffill()
+    if return_type == "log":
+        rets = np.log(px / px.shift(1))
+    else:
+        rets = px.pct_change()
+    
+    # 计算协方差并年化
+    return rets.cov() * annualization
+
+
+def calc_risk_contribution(
+    weights: pd.Series,
+    cov_matrix: pd.DataFrame
+    ) -> pd.Series:
+    """
+    给定当前资产权重和协方差矩阵，计算各资产的百分比风险贡献度 (%RC)。
+    所有资产的 %RC 之和理论上等于 1.0 (或 100%)。
+    """
+    # 提取共有标的并统一顺序
+    idx = weights.index.intersection(cov_matrix.index)
+    if len(idx) == 0:
+        return pd.Series(dtype=float)
+
+    w = weights.reindex(idx).fillna(0.0).values
+    cov = cov_matrix.loc[idx, idx].values
+
+    # 1. 组合总方差与波动率
+    port_var = float(w.T @ cov @ w)
+    if port_var <= 0:
+        return pd.Series(0.0, index=idx)
+    port_vol = np.sqrt(port_var)
+
+    # 2. 边际风险贡献 (MRC) = (Sigma * w) / port_vol
+    mrc = (cov @ w) / port_vol
+
+    # 3. 绝对风险贡献 (RC) = w * MRC
+    rc = w * mrc
+
+    # 4. 百分比风险贡献 (%RC) = RC / port_vol
+    prc = rc / port_vol
+
+    return pd.Series(prc, index=idx)
+
+
+def calc_historical_risk_contributions(
+    weights_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    lookback_window: int = 120,
+    return_type: str = "log",
+    annualization: int = 252
+    ) -> pd.DataFrame:
+    """
+    批量计算回测期间每一天（或每一个调仓点）的实际风险贡献度。
+    用于后续绘制“风险贡献堆叠面积图”，检验风险平价是否破裂。
+    """
+    rc_records = []
+    
+    # 为了避免价格数据透支未来，计算某日的风险贡献时，只能用该日之前的历史价格
+    for dt, weights in weights_df.iterrows():
+        # 截取历史窗口数据
+        hist_px = prices_df.loc[:dt].iloc[-lookback_window:]
+        
+        if len(hist_px) < 2:
+            rc_records.append(pd.Series(0.0, index=weights.index, name=dt))
+            continue
+            
+        # 计算协方差矩阵
+        cov_mat = calc_covariance_matrix(
+            prices=hist_px, 
+            return_type=return_type, 
+            annualization=annualization
+        )
+        
+        # 计算当期的风险贡献
+        rc_series = calc_risk_contribution(weights, cov_mat)
+        rc_series.name = dt
+        rc_records.append(rc_series)
+        
+    return pd.DataFrame(rc_records)
 
 # ============================================================
 # 主回测函数
@@ -827,6 +961,18 @@ def simulate_risk_parity_backtest(
         annualization=annualization,
     )
 
+    corr_matrix = calc_asset_correlation_matrix(val_px, return_type="log")
+    avg_corr = calc_avg_pairwise_correlation(corr_matrix)
+    summary["avg_asset_correlation"] = avg_corr
+
+    risk_contribution_df = calc_historical_risk_contributions(
+        weights_df=weights_df,
+        prices_df=val_px,
+        lookback_window=lookback_window,
+        return_type=rp_weight_kwargs.get("return_type", "log"),
+        annualization=annualization
+    )
+
     return {
         "nav_df": nav_df,
         "returns": returns,
@@ -835,6 +981,8 @@ def simulate_risk_parity_backtest(
         "target_weights_df": target_weights_df,
         "trades_df": trades_df,
         "rebalance_log_df": rebalance_log_df,
+        "asset_corr_matrix": corr_matrix,  # 将相关性矩阵一并输出
+        "risk_contribution_df": risk_contribution_df, # <--- 输出风险贡献矩阵
         "summary": summary,
     }
 
