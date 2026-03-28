@@ -1,5 +1,6 @@
 tushare_token.txt
 data/
+analysis_outputs/
 config/
 notebooks/
 __pycache__/
