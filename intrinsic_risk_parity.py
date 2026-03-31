@@ -106,6 +106,44 @@ def _slice_long_window(df: pd.DataFrame, signal_date: Optional[pd.Timestamp], lo
 
 
 
+def calc_time_momentum_filter_mask_on_date(
+    close_price_df: pd.DataFrame,
+    signal_date: pd.Timestamp,
+    ma_window: int = 120,
+) -> pd.Series:
+    """
+    计算 signal_date 当日的时间动量过滤掩码。
+
+    规则：仅当资产在 signal_date 的收盘价 >= 其 ma_window 日均线时，
+    该资产才保留在 IRP 资产池中；否则临时剔除。
+
+    说明：
+    - 每次都基于“原始全资产池”重新计算，不会永久剔除资产；
+    - 若某资产历史长度不足 ma_window，或 signal_date 当日价格 / 均线缺失，
+      则该资产当次视为不满足过滤条件。
+    """
+    if ma_window <= 0:
+        raise ValueError("ma_window must be a positive integer")
+
+    close_px = ensure_datetime_index(close_price_df)
+    signal_date = pd.Timestamp(signal_date)
+
+    hist_close = close_px.loc[:signal_date]
+    if hist_close.empty:
+        return pd.Series(False, index=close_px.columns, dtype=bool)
+
+    ma = hist_close.rolling(window=ma_window, min_periods=ma_window).mean().iloc[-1]
+    last_close = hist_close.iloc[-1]
+
+    mask = (
+        np.isfinite(last_close)
+        & np.isfinite(ma)
+        & (last_close >= ma)
+    )
+    return pd.Series(mask, index=close_px.columns, dtype=bool)
+
+
+
 def build_intrinsic_feature_window(
     close_price_df: pd.DataFrame,
     activity_df: pd.DataFrame,
@@ -420,6 +458,7 @@ def compute_intrinsic_target_weights_on_date(
     irp_prepare_kwargs: Optional[dict] = None,
     activity_prepare_kwargs: Optional[dict] = None,
     irp_weight_kwargs: Optional[dict] = None,
+    time_momentum_filter_window: Optional[int] = None,
 ) -> pd.Series:
     market = ensure_same_index_columns(market)
 
@@ -428,8 +467,23 @@ def compute_intrinsic_target_weights_on_date(
 
     close_px = ensure_datetime_index(market["close"])
     activity_df = ensure_datetime_index(market[activity_field])
+    full_index = close_px.columns
 
-    return calc_intrinsic_risk_parity_weights_from_matrices(
+    if time_momentum_filter_window is not None:
+        eligible_mask = calc_time_momentum_filter_mask_on_date(
+            close_price_df=close_px,
+            signal_date=signal_date,
+            ma_window=time_momentum_filter_window,
+        )
+        eligible_cols = eligible_mask[eligible_mask].index
+
+        if len(eligible_cols) == 0:
+            return pd.Series(0.0, index=full_index, name="weight")
+
+        close_px = close_px.loc[:, eligible_cols]
+        activity_df = activity_df.loc[:, eligible_cols]
+
+    weights = calc_intrinsic_risk_parity_weights_from_matrices(
         close_price_df=close_px,
         activity_df=activity_df,
         signal_date=signal_date,
@@ -439,6 +493,8 @@ def compute_intrinsic_target_weights_on_date(
         activity_prepare_kwargs=activity_prepare_kwargs,
         irp_weight_kwargs=irp_weight_kwargs,
     )
+
+    return weights.reindex(full_index).fillna(0.0)
 
 
 
@@ -536,6 +592,7 @@ def simulate_intrinsic_risk_parity_backtest(
     irp_prepare_kwargs: Optional[dict] = None,
     activity_prepare_kwargs: Optional[dict] = None,
     irp_weight_kwargs: Optional[dict] = None,
+    time_momentum_filter_window: Optional[int] = None,
     risk_free_rate: float = 0.0,
     annualization: int = 252,
 ) -> dict[str, object]:
@@ -673,9 +730,10 @@ def simulate_intrinsic_risk_parity_backtest(
             irp_prepare_kwargs=irp_prepare_kwargs,
             activity_prepare_kwargs=activity_prepare_kwargs,
             irp_weight_kwargs=irp_weight_kwargs,
+            time_momentum_filter_window=time_momentum_filter_window,
         )
 
-        if len(target_weights_today) == 0 or target_weights_today.sum() <= 0:
+        if len(target_weights_today) == 0:
             continue
 
         target_weight_records.append(
@@ -763,6 +821,7 @@ __all__ = [
     "estimate_intrinsic_covariance_from_matrices",
     "calc_intrinsic_risk_parity_weights_from_covariance",
     "calc_intrinsic_risk_parity_weights_from_matrices",
+    "calc_time_momentum_filter_mask_on_date",
     "compute_intrinsic_target_weights_on_date",
     "calc_intrinsic_risk_contribution",
     "calc_historical_intrinsic_risk_contributions",

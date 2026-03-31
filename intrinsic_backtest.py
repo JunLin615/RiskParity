@@ -59,6 +59,7 @@ def compute_intrinsic_target_weights_on_date(
     irp_prepare_kwargs: Optional[dict] = None,
     activity_prepare_kwargs: Optional[dict] = None,
     irp_weight_kwargs: Optional[dict] = None,
+    time_momentum_filter_window: Optional[int] = None,
 ) -> pd.Series:
     """
     在 signal_date 当日收盘后，用 intrinsic_risk_parity.py 中的逻辑
@@ -73,6 +74,7 @@ def compute_intrinsic_target_weights_on_date(
         irp_prepare_kwargs=irp_prepare_kwargs,
         activity_prepare_kwargs=activity_prepare_kwargs,
         irp_weight_kwargs=irp_weight_kwargs,
+        time_momentum_filter_window=time_momentum_filter_window,
     )
 
 
@@ -104,6 +106,7 @@ def simulate_intrinsic_risk_parity_backtest(
     irp_prepare_kwargs: Optional[dict] = None,
     activity_prepare_kwargs: Optional[dict] = None,
     irp_weight_kwargs: Optional[dict] = None,
+    time_momentum_filter_window: Optional[int] = None,
     risk_free_rate: float = 0.0,
     annualization: int = 252,
 ) -> dict[str, object]:
@@ -265,9 +268,10 @@ def simulate_intrinsic_risk_parity_backtest(
             irp_prepare_kwargs=irp_prepare_kwargs,
             activity_prepare_kwargs=activity_prepare_kwargs,
             irp_weight_kwargs=irp_weight_kwargs,
+            time_momentum_filter_window=time_momentum_filter_window,
         )
 
-        if len(target_weights_today) == 0 or target_weights_today.sum() <= 0:
+        if len(target_weights_today) == 0:
             continue
 
         target_weight_records.append(
