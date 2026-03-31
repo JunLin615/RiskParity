@@ -9,6 +9,7 @@ intrinsic_backtest.py
 - numpy
 - backtest.py
 - intrinsic_risk_parity.py
+- tsmom_utils.py
 
 设计目标：
 1. 尽量复用原 risk parity 回测库的交易/估值/调仓框架
@@ -17,9 +18,13 @@ intrinsic_backtest.py
 4. 严格避免未来函数：
    - t 日收盘后用截至 t 的历史数据生成信号
    - t+1 按指定成交价口径成交
+5. 支持多周期 TSMOM 门控：
+   - 使用 t 日收盘后可得信息生成 {-1, 0, 1} 门控信号
+   - 仅保留门控为 +1 的资产进入当次 IRP 资产池
+   - 若当次资产池为空，则目标权重全为 0，组合持有现金
 """
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -43,6 +48,58 @@ from intrinsic_risk_parity import (
     compute_intrinsic_target_weights_on_date as _compute_intrinsic_target_weights_on_date,
 )
 from risk_parity import ensure_datetime_index
+from tsmom_utils import build_tsmom_gate_bundle
+
+
+# ============================================================
+# 门控工具
+# ============================================================
+
+
+def _normalize_multi_period_gate_params(
+    multi_period_gate_params: Optional[dict],
+) -> Optional[dict]:
+    if multi_period_gate_params is None:
+        return None
+
+    params = dict(multi_period_gate_params)
+    params.setdefault("execution_lag", 0)
+    params.setdefault("gate_type", "directional")
+    return params
+
+
+
+def build_multi_period_gate_signal_matrix(
+    market: dict[str, pd.DataFrame],
+    gate_price_field: str = "close",
+    multi_period_gate_params: Optional[dict] = None,
+) -> pd.DataFrame:
+    """
+    预先构造整段回测区间上的多周期门控矩阵。
+
+    返回值恒为与 market[gate_price_field] 同 shape 的 DataFrame，
+    元素严格离散到 {-1, 0, 1}。
+
+    若 multi_period_gate_params 为 None，则返回全 1 矩阵，表示
+    “不过滤任何资产”。
+    """
+    market = ensure_same_index_columns(market)
+    price_df = ensure_datetime_index(market[gate_price_field])
+
+    if multi_period_gate_params is None:
+        return pd.DataFrame(1.0, index=price_df.index, columns=price_df.columns)
+
+    params = _normalize_multi_period_gate_params(multi_period_gate_params)
+    gate_bundle = build_tsmom_gate_bundle(
+        price_df=price_df,
+        **params,
+    )
+
+    gate_df = ensure_datetime_index(gate_bundle["gate"])
+    gate_df = gate_df.reindex(index=price_df.index, columns=price_df.columns)
+    gate_df = gate_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    gate_df = np.sign(gate_df).astype(float)
+    return gate_df
 
 
 # ============================================================
@@ -60,13 +117,27 @@ def compute_intrinsic_target_weights_on_date(
     activity_prepare_kwargs: Optional[dict] = None,
     irp_weight_kwargs: Optional[dict] = None,
     time_momentum_filter_window: Optional[int] = None,
+    eligible_assets: Optional[Sequence[str]] = None,
 ) -> pd.Series:
     """
     在 signal_date 当日收盘后，用 intrinsic_risk_parity.py 中的逻辑
     计算目标本征风险平价权重。
+
+    若提供 eligible_assets，则先把资产池裁切为该子集，再做 IRP。
+    若裁切后资产池为空，则返回全 0 权重（持有现金）。
     """
-    return _compute_intrinsic_target_weights_on_date(
-        market=market,
+    market = ensure_same_index_columns(market)
+    full_index = ensure_datetime_index(market["close"]).columns
+
+    filtered_market = market
+    if eligible_assets is not None:
+        eligible_cols = full_index.intersection(pd.Index(list(eligible_assets)))
+        if len(eligible_cols) == 0:
+            return pd.Series(0.0, index=full_index, name="weight")
+        filtered_market = {k: v.loc[:, eligible_cols].copy() for k, v in market.items()}
+
+    weights = _compute_intrinsic_target_weights_on_date(
+        market=filtered_market,
         signal_date=signal_date,
         lookback_window=lookback_window,
         long_lookback_window=long_lookback_window,
@@ -76,6 +147,7 @@ def compute_intrinsic_target_weights_on_date(
         irp_weight_kwargs=irp_weight_kwargs,
         time_momentum_filter_window=time_momentum_filter_window,
     )
+    return weights.reindex(full_index).fillna(0.0)
 
 
 # 为了尽量贴近原 backtest.py 的接口风格，给一个同名别名。
@@ -107,6 +179,8 @@ def simulate_intrinsic_risk_parity_backtest(
     activity_prepare_kwargs: Optional[dict] = None,
     irp_weight_kwargs: Optional[dict] = None,
     time_momentum_filter_window: Optional[int] = None,
+    multi_period_gate_params: Optional[dict] = None,
+    multi_period_gate_price_field: str = "close",
     risk_free_rate: float = 0.0,
     annualization: int = 252,
 ) -> dict[str, object]:
@@ -116,14 +190,14 @@ def simulate_intrinsic_risk_parity_backtest(
     与原 simulate_risk_parity_backtest 基本保持一致，唯一核心差异是：
     目标权重由 intrinsic_risk_parity.py 负责生成。
 
-    参数说明
+    新增参数
     --------
-    lookback_window : int
-        本征协方差矩阵的时间回看窗口 lbw。
-    long_lookback_window : int
-        构造 zr / zv 的长期回看窗口 llbw。
-    activity_field : str
-        活跃度字段，默认使用 amount；也可以换成 vol。
+    multi_period_gate_params : dict | None
+        若不为 None，则使用 tsmom_utils.py 中的多周期门控逻辑生成门控矩阵，
+        每次在计算 IRP 调仓目标前，仅保留门控为 +1 的资产；门控为 -1 / 0
+        的资产暂时剔除出资产池。
+    multi_period_gate_price_field : str
+        构造门控时使用的价格字段，默认 close。
     """
     if long_lookback_window < lookback_window:
         raise ValueError("long_lookback_window must be >= lookback_window")
@@ -135,6 +209,8 @@ def simulate_intrinsic_risk_parity_backtest(
     market = ensure_same_index_columns(market)
     if activity_field not in market:
         raise ValueError(f"market missing '{activity_field}'")
+    if multi_period_gate_price_field not in market:
+        raise ValueError(f"market missing '{multi_period_gate_price_field}'")
 
     close_px = ensure_datetime_index(market["close"])
 
@@ -149,6 +225,14 @@ def simulate_intrinsic_risk_parity_backtest(
     dates = close_px.index
     codes = close_px.columns
     scheduled_dates = get_rebalance_dates(dates, freq=rebalance_freq)
+
+    gate_signal_df = build_multi_period_gate_signal_matrix(
+        market=market,
+        gate_price_field=multi_period_gate_price_field,
+        multi_period_gate_params=multi_period_gate_params,
+    ).reindex(index=dates, columns=codes).fillna(0.0)
+    gate_signal_df = np.sign(gate_signal_df).astype(float)
+    gate_eligible_count = (gate_signal_df > 0).sum(axis=1).rename("eligible_asset_count")
 
     # 组合状态
     shares = pd.Series(0, index=codes, dtype=int)
@@ -181,6 +265,7 @@ def simulate_intrinsic_risk_parity_backtest(
             signal_date = pending_signal["signal_date"]
             reason = pending_signal["reason"]
             drift_value = pending_signal["drift_value"]
+            gate_eligible_assets = pending_signal["gate_eligible_assets"]
 
             involved_assets = shares[shares > 0].index.union(target_weights[target_weights > 0].index)
             involved_exec_px = exec_today.reindex(involved_assets)
@@ -222,6 +307,7 @@ def simulate_intrinsic_risk_parity_backtest(
                         "cash_after_trade": cash,
                         "traded": int(len(trades_df) > 0),
                         "trade_count": int(len(trades_df)),
+                        "gate_eligible_assets": int(gate_eligible_assets),
                     }
                 )
                 pending_signal = None
@@ -259,6 +345,9 @@ def simulate_intrinsic_risk_parity_backtest(
         if activity_df.loc[:dt].shape[0] < long_lookback_window + 1:
             continue
 
+        gate_signal_today = gate_signal_df.loc[dt].reindex(codes).fillna(0.0).astype(float)
+        eligible_assets_today = gate_signal_today[gate_signal_today > 0].index
+
         target_weights_today = compute_intrinsic_target_weights_on_date(
             market=market,
             signal_date=dt,
@@ -269,10 +358,8 @@ def simulate_intrinsic_risk_parity_backtest(
             activity_prepare_kwargs=activity_prepare_kwargs,
             irp_weight_kwargs=irp_weight_kwargs,
             time_momentum_filter_window=time_momentum_filter_window,
+            eligible_assets=eligible_assets_today,
         )
-
-        if len(target_weights_today) == 0:
-            continue
 
         target_weight_records.append(
             pd.DataFrame([target_weights_today.reindex(codes).fillna(0.0).values], index=[dt], columns=codes)
@@ -297,6 +384,7 @@ def simulate_intrinsic_risk_parity_backtest(
                     "target_weights": target_weights_today,
                     "reason": reason,
                     "drift_value": drift_value,
+                    "gate_eligible_assets": int((gate_signal_today > 0).sum()),
                 }
 
     # ------------------------------------------------------
@@ -330,6 +418,7 @@ def simulate_intrinsic_risk_parity_backtest(
     corr_matrix = calc_asset_correlation_matrix(val_px, return_type="log")
     avg_corr = calc_avg_pairwise_correlation(corr_matrix)
     summary["avg_asset_correlation"] = avg_corr
+    summary["avg_gate_eligible_assets"] = float(gate_eligible_count.mean()) if len(gate_eligible_count) > 0 else np.nan
 
     risk_contribution_df = calc_historical_intrinsic_risk_contributions(
         weights_df=weights_df,
@@ -352,11 +441,15 @@ def simulate_intrinsic_risk_parity_backtest(
         "rebalance_log_df": rebalance_log_df,
         "asset_corr_matrix": corr_matrix,
         "risk_contribution_df": risk_contribution_df,
+        "gate_signal_df": gate_signal_df,
+        "gate_eligible_count": gate_eligible_count,
+        "gate_enabled": multi_period_gate_params is not None,
         "summary": summary,
     }
 
 
 __all__ = [
+    "build_multi_period_gate_signal_matrix",
     "compute_intrinsic_target_weights_on_date",
     "compute_target_weights_on_date",
     "simulate_intrinsic_risk_parity_backtest",
@@ -426,6 +519,15 @@ if __name__ == "__main__":
             "annualization": 252,
             "drop_any_na": True,
             "long_only": True,
+        },
+        multi_period_gate_params={
+            "lookback": [21, 63, 126],
+            "signal_type": "sign",
+            "use_excess_returns": False,
+            "combination_method": "vote",
+            "gate_type": "directional",
+            "gate_threshold": 0.0,
+            "execution_lag": 0,
         },
     )
 
