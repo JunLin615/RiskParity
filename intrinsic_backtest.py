@@ -118,6 +118,7 @@ def compute_intrinsic_target_weights_on_date(
     irp_weight_kwargs: Optional[dict] = None,
     time_momentum_filter_window: Optional[int] = None,
     eligible_assets: Optional[Sequence[str]] = None,
+    cap_single_asset_to_full_pool: bool = False,
 ) -> pd.Series:
     """
     在 signal_date 当日收盘后，用 intrinsic_risk_parity.py 中的逻辑
@@ -147,7 +148,17 @@ def compute_intrinsic_target_weights_on_date(
         irp_weight_kwargs=irp_weight_kwargs,
         time_momentum_filter_window=time_momentum_filter_window,
     )
-    return weights.reindex(full_index).fillna(0.0)
+
+    out = weights.reindex(full_index).fillna(0.0).astype(float)
+
+    if cap_single_asset_to_full_pool:
+        active = out[out > 0.0]
+        if len(active) == 1 and len(full_index) > 0:
+            cap = 1.0 / float(len(full_index))
+            only_asset = active.index[0]
+            out.loc[only_asset] = min(float(out.loc[only_asset]), cap)
+
+    return out
 
 
 # 为了尽量贴近原 backtest.py 的接口风格，给一个同名别名。
@@ -183,6 +194,7 @@ def simulate_intrinsic_risk_parity_backtest(
     multi_period_gate_price_field: str = "close",
     risk_free_rate: float = 0.0,
     annualization: int = 252,
+    cap_single_asset_to_full_pool: bool = False,
 ) -> dict[str, object]:
     """
     本征风险平价回测主入口。
@@ -288,6 +300,7 @@ def simulate_intrinsic_risk_parity_backtest(
                     max_trade_amount_ratio=max_trade_amount_ratio,
                     amount_unit_scale=amount_unit_scale,
                     trade_date=dt,
+                    allow_cash_residual=cap_single_asset_to_full_pool,
                 )
 
                 shares = new_shares
@@ -359,6 +372,7 @@ def simulate_intrinsic_risk_parity_backtest(
             irp_weight_kwargs=irp_weight_kwargs,
             time_momentum_filter_window=time_momentum_filter_window,
             eligible_assets=eligible_assets_today,
+            cap_single_asset_to_full_pool=cap_single_asset_to_full_pool,
         )
 
         target_weight_records.append(

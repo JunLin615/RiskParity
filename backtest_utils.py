@@ -674,7 +674,7 @@ def _simulate_constant_weight_portfolio(
             if target_risky_weight < 1.0:
                 # 未投资部分保持现金
                 pass
-            elif target_risky_weight > 1.0:
+            elif target_risky_weight > 1.0+1e-12:
                 raise ValueError("target risky weight sum exceeds 1.0; leverage is not supported in this function")
 
             full_pre = pd.concat([pre_weights, pd.Series({"__cash__": pre_cash_weight})])

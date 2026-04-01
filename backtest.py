@@ -51,6 +51,29 @@ def normalize_weights(weights: pd.Series) -> pd.Series:
     return w / s
 
 
+def prepare_target_weights(
+    target_weights: pd.Series,
+    index: pd.Index,
+    allow_cash_residual: bool = False,
+) -> pd.Series:
+    """
+    统一清洗目标权重。
+
+    - 默认 allow_cash_residual=False：保持旧行为，将权重归一化为满仓口径。
+    - allow_cash_residual=True：允许权重和小于 1，剩余部分保留为现金。
+      此时若权重和大于 1，则视为非法输入并报错。
+    """
+    w = target_weights.reindex(index).fillna(0.0).clip(lower=0.0).astype(float)
+    s = float(w.sum())
+
+    if allow_cash_residual:
+        if s > 1.0 + 1e-12:
+            raise ValueError(f"target_weights.sum() = {s:.6f} > 1.0")
+        return w
+
+    return normalize_weights(w)
+
+
 def ensure_same_index_columns(df_dict: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     """
     确保多个矩阵的 index / columns 一致，以 close 为主基准。
@@ -398,6 +421,7 @@ def _buy_step_iterative(
     lot_size_map: pd.Series,
     cash: float,
     trade_date: pd.Timestamp,
+    allow_cash_residual: bool = False,
 ) -> tuple[pd.Series, float, list[dict]]:
     """
     迭代买入：
@@ -407,7 +431,11 @@ def _buy_step_iterative(
     trades = []
 
     remaining_cap = trade_value_caps.copy().astype(float)
-    target_weights = normalize_weights(target_weights.reindex(shares.index).fillna(0.0))
+    target_weights = prepare_target_weights(
+        target_weights=target_weights,
+        index=shares.index,
+        allow_cash_residual=allow_cash_residual,
+    )
     blocked = pd.Series(False, index=shares.index)
 
     while True:
@@ -479,6 +507,7 @@ def rebalance_to_target_weights(
     max_trade_amount_ratio: Optional[float] = None,
     amount_unit_scale: float = 1000.0,
     trade_date: Optional[pd.Timestamp] = None,
+    allow_cash_residual: bool = False,
 ) -> tuple[pd.Series, float, pd.DataFrame, pd.Series]:
     """
     将当前持仓调仓到目标权重附近。
@@ -488,7 +517,11 @@ def rebalance_to_target_weights(
 
     idx = current_shares.index.union(target_weights.index).union(exec_prices.index)
     shares = current_shares.reindex(idx).fillna(0).astype(int)
-    target_weights = normalize_weights(target_weights.reindex(idx).fillna(0.0))
+    target_weights = prepare_target_weights(
+        target_weights=target_weights,
+        index=idx,
+        allow_cash_residual=allow_cash_residual,
+    )
     exec_prices = exec_prices.reindex(idx)
     val_prices = val_prices.reindex(idx)
     
@@ -549,6 +582,7 @@ def rebalance_to_target_weights(
         lot_size_map=lot_size_map,
         cash=cash_after_sell,
         trade_date=trade_date,
+        allow_cash_residual=allow_cash_residual,
     )
 
     trades = sell_trades + buy_trades
