@@ -144,7 +144,31 @@ def normalize_adjust_type(adjust_type: Optional[str]) -> str:
         return "hfq"
     raise ValueError(f"不支持的 adjust_type: {adjust_type!r}")
 
+def resolve_watchlist(
+    manager,
+    watchlist: Optional[Iterable[str]] = None,
+    listed_only: bool = True,
+) -> list[str]:
+    """
+    统一解析资产池：
+    1. 如果没传或传空，则从数据库读取
+    2. 如果传了，则直接使用传入的资产池
+    3. 最终统一返回 list[str]
+    """
 
+    # 情况1：未提供
+    if watchlist is None:
+        return manager.store.get_ts_codes(listed_only=listed_only)
+
+    # 转成 list，兼容 tuple / set / 生成器
+    watchlist = list(watchlist)
+
+    # 情况2：提供了但为空
+    if len(watchlist) == 0:
+        return manager.store.get_ts_codes(listed_only=listed_only)
+
+    # 情况3：提供了有效资产池
+    return watchlist
 # =========================
 # 配置
 # =========================
