@@ -7,3 +7,4 @@ __pycache__/
 .vscode/
 src/
 Trading_advice/
+factor_definition/
