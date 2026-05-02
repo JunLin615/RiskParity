@@ -277,17 +277,29 @@ def calc_label_valid_mask(
     valid = ret.notna() & np.isfinite(ret)
 
     if universe_mask is not None:
-        uni = make_boolean_frame(universe_mask).reindex(index=ret.index, columns=ret.columns).fillna(False)
+        uni = (
+            make_boolean_frame(universe_mask)
+            .reindex(index=ret.index, columns=ret.columns, fill_value=False)
+            .astype(bool)
+        )
         valid &= uni
 
     if buyable_mask is not None:
-        buyable = make_boolean_frame(buyable_mask).reindex(index=ret.index, columns=ret.columns)
-        buyable_at_signal = buyable.shift(-buy_offset).fillna(False)
+        buyable = (
+            make_boolean_frame(buyable_mask)
+            .reindex(index=ret.index, columns=ret.columns, fill_value=False)
+            .astype(bool)
+        )
+        buyable_at_signal = buyable.shift(-buy_offset, fill_value=False).astype(bool)
         valid &= buyable_at_signal
 
     if sellable_mask is not None:
-        sellable = make_boolean_frame(sellable_mask).reindex(index=ret.index, columns=ret.columns)
-        sellable_at_signal = sellable.shift(-sell_offset).fillna(False)
+        sellable = (
+            make_boolean_frame(sellable_mask)
+            .reindex(index=ret.index, columns=ret.columns, fill_value=False)
+            .astype(bool)
+        )
+        sellable_at_signal = sellable.shift(-sell_offset, fill_value=False).astype(bool)
         valid &= sellable_at_signal
 
     return valid.astype(bool)
