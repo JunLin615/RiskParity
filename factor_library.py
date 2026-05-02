@@ -807,6 +807,7 @@ def build_all_factors(
 
     base_factors: dict[str, pd.DataFrame] = {}
     if include_base:
+        print("[进度 1/3] 计算基础量价因子...")
         base_factors = calc_base_time_series_factors(
             market=market,
             basic=basic,
@@ -819,8 +820,10 @@ def build_all_factors(
             min_periods_ratio=config.min_periods_ratio,
         )
         factors.update(base_factors)
+        print("[进度 1/3] ✅ 基础因子计算完成")
 
     if include_window:
+        print("[进度 2/3] 计算滚动窗口因子（耗时较长）...")
         factors.update(calc_window_time_series_factors(
             market=market,
             base_factors=base_factors,
@@ -830,9 +833,12 @@ def build_all_factors(
             min_periods_ratio=config.min_periods_ratio,
             eps=config.eps,
         ))
+        print("[进度 2/3] ✅ 滚动因子计算完成")
 
     if include_scalar and basic is not None:
+        print("[进度 3/3] 计算估值&市值因子...")
         factors.update(calc_scalar_factors(basic=basic, eps=config.eps, winsorize_pb_ps=True))
+        print("[进度 3/3] ✅ 估值因子计算完成")
 
     return factors
 

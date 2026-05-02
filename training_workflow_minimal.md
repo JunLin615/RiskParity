@@ -298,6 +298,46 @@ early_stopping_patience
 
 ---
 
+## 8. 训练入口示意
+
+1. 先生成训练集 / bundle
+python run_build_training_bundle.py --config build_and_train_config_example.json
+
+它会读取：
+
+stock_data.py 数据库
+daily / daily_basic / moneyflow / eligibility / can_buy / can_sell
+
+然后生成：
+
+data/cache/stage1_factor_label_bundle.pkl
+data/cache/stage1_factor_label_bundle.build_config.json
+data/cache/stage1_factor_label_bundle.metadata.json
+data/cache/stage1_factor_label_bundle.input_config.json
+
+其中 stage1_factor_label_bundle.pkl 就是后续训练使用的训练数据缓存。
+
+2. 再启动训练
+python run_train_ranker.py --config build_and_train_config_example.json
+
+它会读取：
+
+data/cache/stage1_factor_label_bundle.pkl
+
+然后创建：
+
+checkpoints/dual_transformer_ranker/
+  时间戳文件夹/
+    train_config.json
+    model_config.json
+    dataset_summary.json
+    launcher_config.json
+    input_config.json
+    history.csv
+    best.pt
+    last.pt
+    run_summary.json
+
 ## 8. 实验记录模板
 
 每次训练后复制一份。

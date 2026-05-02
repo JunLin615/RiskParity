@@ -1,0 +1,23 @@
+{
+  "num_ts_factors": 62,
+  "num_scalar_factors": 8,
+  "seq_len": 128,
+  "temporal_channels": 8,
+  "temporal_compressed_len": 16,
+  "temporal_kernel_size": 5,
+  "temporal_conv_layers": 2,
+  "model_dim": 128,
+  "factor_num_layers": 1,
+  "factor_num_heads": 4,
+  "factor_ff_dim": 256,
+  "cross_num_layers": 1,
+  "cross_num_heads": 4,
+  "cross_ff_dim": 256,
+  "dropout": 0.1,
+  "activation": "gelu",
+  "norm_first": true,
+  "score_hidden_dim": 128,
+  "score_head_layers": 2,
+  "input_nan_to_num": true,
+  "output_squeeze_batch_if_unbatched": true
+}

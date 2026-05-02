@@ -1,0 +1,26 @@
+{
+  "train": {
+    "signal_date_count": 1087.0,
+    "samples_per_date": 1.0,
+    "dataset_length": 1087.0,
+    "sample_size": 512.0,
+    "seq_len": 128.0,
+    "ts_factor_count": 62.0,
+    "scalar_factor_count": 8.0,
+    "min_valid_codes": 1284.0,
+    "median_valid_codes": 4162.0,
+    "max_valid_codes": 5147.0
+  },
+  "valid": {
+    "signal_date_count": 242.0,
+    "samples_per_date": 1.0,
+    "dataset_length": 242.0,
+    "sample_size": 512.0,
+    "seq_len": 128.0,
+    "ts_factor_count": 62.0,
+    "scalar_factor_count": 8.0,
+    "min_valid_codes": 3882.0,
+    "median_valid_codes": 5136.0,
+    "max_valid_codes": 5202.0
+  }
+}
