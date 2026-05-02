@@ -53,6 +53,7 @@ import json
 import math
 import random
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -97,9 +98,18 @@ class TrainConfig:
     device: str = "auto"
     seed: int = 42
 
+    # Experiment output.
+    # checkpoint_dir is treated as the experiment root by default.
+    # Each fit_model() call creates checkpoint_dir/<timestamp_or_run_name>/.
     checkpoint_dir: Optional[str] = None
+    create_timestamp_run_dir: bool = True
+    run_name: Optional[str] = None
+    timestamp_format: str = "%Y%m%d_%H%M%S"
     save_best: bool = True
     save_last: bool = True
+    save_history_each_epoch: bool = True
+    save_dataset_summary: bool = True
+    save_model_config: bool = True
 
     early_stopping_patience: Optional[int] = 10
     metric_for_best: str = "valid_rank_ic"
@@ -271,9 +281,6 @@ def train_one_epoch(
 
         losses.append(float(loss.detach().cpu().item()))
 
-
-        losses.append(float(loss.detach().cpu().item()))
-
         metrics = compute_batch_metrics(
             scores.detach(),
             batch["y"].detach(),
@@ -400,6 +407,97 @@ def _is_better(value: float, best: Optional[float], maximize: bool) -> bool:
     return value > best if maximize else value < best
 
 
+def _json_safe(obj: Any) -> Any:
+    """Convert common Python/numpy/pandas objects to JSON-safe values."""
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (pd.Timestamp,)):
+        return obj.isoformat()
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
+
+
+def write_json(path: str | Path, data: dict[str, Any]) -> Path:
+    """Write JSON with UTF-8 encoding."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(_json_safe(data), f, ensure_ascii=False, indent=2)
+    return p
+
+
+def make_run_dir(train_config: TrainConfig) -> Optional[Path]:
+    """
+    Resolve run output directory.
+
+    If checkpoint_dir is None, no files are written.
+
+    Default layout:
+        checkpoint_dir/YYYYMMDD_HHMMSS/
+
+    If run_name is provided:
+        checkpoint_dir/run_name/
+
+    If the target folder already exists, suffixes _001, _002, ... are appended.
+    """
+    if train_config.checkpoint_dir is None:
+        return None
+
+    root = Path(train_config.checkpoint_dir)
+
+    if train_config.create_timestamp_run_dir:
+        run_name = train_config.run_name or datetime.now().strftime(train_config.timestamp_format)
+        base = root / run_name
+    else:
+        base = root
+
+    if not base.exists():
+        base.mkdir(parents=True, exist_ok=False)
+        return base
+
+    if not train_config.create_timestamp_run_dir:
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    for i in range(1, 1000):
+        candidate = Path(f"{base}_{i:03d}")
+        if not candidate.exists():
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+
+    raise RuntimeError(f"could not create unique run directory under {root}")
+
+
+def dataset_summary_dict(dataset: Optional[rd.CrossSectionRankDataset]) -> Optional[dict[str, Any]]:
+    """Return JSON-safe dataset summary if available."""
+    if dataset is None:
+        return None
+    if hasattr(dataset, "summary"):
+        summary = dataset.summary()
+        if hasattr(summary, "to_dict"):
+            return _json_safe(summary.to_dict())
+    return {
+        "length": len(dataset),
+    }
+
+
+def save_history_csv(history: list[dict[str, float]], path: str | Path) -> Path:
+    """Save training history as CSV."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(history).to_csv(p, index=False)
+    return p
+
+
 # ============================================================
 # Full training
 # ============================================================
@@ -413,6 +511,19 @@ def fit_model(
 ) -> pd.DataFrame:
     """
     Fit model and return training history as DataFrame.
+
+    Output layout when train_config.checkpoint_dir is set:
+        checkpoint_dir/
+          20260503_153012/
+            train_config.json
+            model_config.json
+            dataset_summary.json
+            history.csv
+            best.pt
+            last.pt
+            run_summary.json
+
+    If train_config.run_name is provided, it is used instead of timestamp.
     """
     set_global_seed(train_config.seed)
 
@@ -424,21 +535,37 @@ def fit_model(
     train_loader = make_dataloader(train_dataset, train_config, shuffle=True)
     valid_loader = make_dataloader(valid_dataset, train_config, shuffle=False) if valid_dataset is not None else None
 
-    checkpoint_dir = Path(train_config.checkpoint_dir) if train_config.checkpoint_dir is not None else None
-    if checkpoint_dir is not None:
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        with (checkpoint_dir / "train_config.json").open("w", encoding="utf-8") as f:
-            json.dump(asdict(train_config), f, ensure_ascii=False, indent=2)
+    run_dir = make_run_dir(train_config)
+
+    if run_dir is not None:
+        write_json(run_dir / "train_config.json", asdict(train_config))
+
+        if train_config.save_model_config:
+            model_config = model.get_config_dict() if hasattr(model, "get_config_dict") else {}
+            write_json(run_dir / "model_config.json", model_config)
+
+        if train_config.save_dataset_summary:
+            write_json(
+                run_dir / "dataset_summary.json",
+                {
+                    "train": dataset_summary_dict(train_dataset),
+                    "valid": dataset_summary_dict(valid_dataset),
+                },
+            )
 
     history: list[dict[str, float]] = []
     best_metric: Optional[float] = None
+    best_epoch: Optional[int] = None
     bad_epochs = 0
+    stopped_early = False
 
     print(f"device={device}")
     print(f"train_samples={len(train_dataset)}")
     if valid_dataset is not None:
         print(f"valid_samples={len(valid_dataset)}")
     print(f"parameters={dtm.count_parameters(model) if hasattr(dtm, 'count_parameters') else 'unknown'}")
+    if run_dir is not None:
+        print(f"run_dir={run_dir}")
 
     for epoch in range(1, int(train_config.max_epochs) + 1):
         train_metrics = train_one_epoch(
@@ -482,29 +609,39 @@ def fit_model(
             f"tau={row.get('temperature', float('nan')):.4f}"
         )
 
-        if checkpoint_dir is not None and train_config.save_last:
+        if run_dir is not None and train_config.save_history_each_epoch:
+            save_history_csv(history, run_dir / "history.csv")
+
+        if run_dir is not None and train_config.save_last:
             save_checkpoint(
-                checkpoint_dir / "last.pt",
+                run_dir / "last.pt",
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
                 train_config=train_config,
                 history=history,
+                extra={"run_dir": str(run_dir)},
             )
 
         if metric_value is not None and train_config.save_best:
             if _is_better(float(metric_value), best_metric, bool(train_config.maximize_metric)):
                 best_metric = float(metric_value)
+                best_epoch = int(epoch)
                 bad_epochs = 0
-                if checkpoint_dir is not None:
+                if run_dir is not None:
                     save_checkpoint(
-                        checkpoint_dir / "best.pt",
+                        run_dir / "best.pt",
                         model=model,
                         optimizer=optimizer,
                         epoch=epoch,
                         train_config=train_config,
                         history=history,
-                        extra={"best_metric": best_metric, "metric_name": metric_name},
+                        extra={
+                            "best_metric": best_metric,
+                            "best_epoch": best_epoch,
+                            "metric_name": metric_name,
+                            "run_dir": str(run_dir),
+                        },
                     )
             else:
                 bad_epochs += 1
@@ -512,9 +649,40 @@ def fit_model(
         if train_config.early_stopping_patience is not None and valid_loader is not None:
             if bad_epochs >= int(train_config.early_stopping_patience):
                 print(f"early stopping at epoch={epoch}, bad_epochs={bad_epochs}")
+                stopped_early = True
                 break
 
-    return pd.DataFrame(history)
+    history_df = pd.DataFrame(history)
+
+    if run_dir is not None:
+        # Ensure final history exists even if save_history_each_epoch=False.
+        save_history_csv(history, run_dir / "history.csv")
+
+        write_json(
+            run_dir / "run_summary.json",
+            {
+                "run_dir": str(run_dir),
+                "completed_epochs": len(history),
+                "stopped_early": stopped_early,
+                "metric_for_best": train_config.metric_for_best,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "final_metrics": history[-1] if history else {},
+                "files": {
+                    "train_config": "train_config.json",
+                    "model_config": "model_config.json",
+                    "dataset_summary": "dataset_summary.json",
+                    "history": "history.csv",
+                    "best_checkpoint": "best.pt",
+                    "last_checkpoint": "last.pt",
+                },
+            },
+        )
+        history_df.attrs["run_dir"] = str(run_dir)
+
+    return history_df
+
+
 
 
 # ============================================================
