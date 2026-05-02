@@ -156,6 +156,7 @@ class StockDataConfig:
         "moneyflow": RateLimitConfig(per_minute=120),
         "stock_st": RateLimitConfig(per_minute=60),
         "st": RateLimitConfig(per_minute=60),
+        "suspend_d": RateLimitConfig(per_minute=120),
         "stk_factor_pro": RateLimitConfig(per_minute=500),
     })
 
@@ -328,6 +329,61 @@ class StockTushareClient:
         if df.empty:
             return df
         df["source"] = "tushare_stock_st"
+        df["created_at"] = now_str()
+        df["updated_at"] = now_str()
+        return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+
+    def fetch_suspend_d_by_trade_date(
+        self,
+        trade_date: str,
+        suspend_type: str = "S",
+    ) -> pd.DataFrame:
+        """
+        获取每日停复牌信息。
+
+        Tushare suspend_d 常用参数：
+        - suspend_type="S"：停牌
+        - suspend_type="R"：复牌
+        - trade_date="YYYYMMDD"：查询交易日
+
+        不同 tushare 版本返回字段可能略有差异；这里统一补齐 trade_date / suspend_type，
+        便于落库为日频状态表。
+        """
+        trade_date = ensure_yyyymmdd(trade_date)
+        suspend_type = str(suspend_type or "S").upper()
+
+        if hasattr(self.pro, "suspend_d"):
+            df = self._call_with_retry(
+                "suspend_d",
+                self.pro.suspend_d,
+                suspend_type=suspend_type,
+                trade_date=trade_date,
+            )
+        else:
+            def _query_suspend_d(**kwargs):
+                return self.pro.query("suspend_d", **kwargs)
+
+            df = self._call_with_retry(
+                "suspend_d",
+                _query_suspend_d,
+                suspend_type=suspend_type,
+                trade_date=trade_date,
+            )
+
+        if df.empty:
+            return df
+
+        df = df.copy()
+        if "trade_date" not in df.columns:
+            if "suspend_date" in df.columns:
+                df["trade_date"] = df["suspend_date"].fillna(trade_date).astype(str)
+            elif "resume_date" in df.columns:
+                df["trade_date"] = df["resume_date"].fillna(trade_date).astype(str)
+            else:
+                df["trade_date"] = trade_date
+
+        df["suspend_type"] = suspend_type
+        df["source"] = "tushare_suspend_d"
         df["created_at"] = now_str()
         df["updated_at"] = now_str()
         return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
@@ -546,6 +602,23 @@ class StockDataStore:
             """)
 
             cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_suspend_daily (
+                ts_code TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                suspend_date TEXT,
+                resume_date TEXT,
+                suspend_type TEXT,
+                suspend_reason TEXT,
+                ann_date TEXT,
+                reason_type TEXT,
+                source TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (ts_code, trade_date, suspend_type)
+            );
+            """)
+
+            cur.execute("""
             CREATE TABLE IF NOT EXISTS stock_st_event (
                 ts_code TEXT NOT NULL,
                 pub_date TEXT NOT NULL,
@@ -580,6 +653,7 @@ class StockDataStore:
                 is_listed INTEGER,
                 is_st INTEGER,
                 is_suspended INTEGER,
+                is_explicit_suspended INTEGER,
                 has_daily INTEGER,
                 has_daily_basic INTEGER,
                 has_moneyflow INTEGER,
@@ -588,12 +662,32 @@ class StockDataStore:
                 circ_mv REAL,
                 amount REAL,
                 close REAL,
+                pre_close REAL,
+                limit_rate REAL,
+                up_limit REAL,
+                down_limit REAL,
+                is_limit_up INTEGER,
+                is_limit_down INTEGER,
+                can_buy INTEGER,
+                can_sell INTEGER,
                 is_eligible INTEGER,
                 created_at TEXT,
                 updated_at TEXT,
                 PRIMARY KEY (ts_code, trade_date)
             );
             """)
+
+            self._ensure_columns(conn, "stock_eligibility_daily", {
+                "is_explicit_suspended": "INTEGER",
+                "pre_close": "REAL",
+                "limit_rate": "REAL",
+                "up_limit": "REAL",
+                "down_limit": "REAL",
+                "is_limit_up": "INTEGER",
+                "is_limit_down": "INTEGER",
+                "can_buy": "INTEGER",
+                "can_sell": "INTEGER",
+            })
 
             cur.execute("""
             CREATE TABLE IF NOT EXISTS ingestion_state (
@@ -633,6 +727,7 @@ class StockDataStore:
             "CREATE INDEX IF NOT EXISTS idx_stock_daily_basic_trade_date ON stock_daily_basic(trade_date, ts_code);",
             "CREATE INDEX IF NOT EXISTS idx_stock_moneyflow_trade_date ON stock_moneyflow(trade_date, ts_code);",
             "CREATE INDEX IF NOT EXISTS idx_stock_st_daily_trade_date ON stock_st_daily(trade_date, ts_code);",
+            "CREATE INDEX IF NOT EXISTS idx_stock_suspend_daily_trade_date ON stock_suspend_daily(trade_date, ts_code);",
             "CREATE INDEX IF NOT EXISTS idx_stock_factor_pro_trade_date ON stock_factor_pro(trade_date, ts_code);",
             "CREATE INDEX IF NOT EXISTS idx_stock_eligibility_daily_trade_date ON stock_eligibility_daily(trade_date, ts_code);",
             "CREATE INDEX IF NOT EXISTS idx_update_log_table_key ON update_log(table_name, key_type, key_value);",
@@ -977,6 +1072,40 @@ class StockDataStore:
             conn.executemany(sql, x.to_dict("records"))
             conn.commit()
 
+    def upsert_stock_suspend_daily(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        keep_cols = [
+            "ts_code", "trade_date", "suspend_date", "resume_date",
+            "suspend_type", "suspend_reason", "ann_date", "reason_type",
+            "source", "created_at", "updated_at"
+        ]
+        x = self._normalize_records(df, keep_cols, "tushare_suspend_d")
+        if "suspend_type" not in x.columns or x["suspend_type"].isna().all():
+            x["suspend_type"] = "S"
+        x["suspend_type"] = x["suspend_type"].fillna("S").astype(str).str.upper()
+        sql = """
+        INSERT INTO stock_suspend_daily (
+            ts_code, trade_date, suspend_date, resume_date, suspend_type,
+            suspend_reason, ann_date, reason_type, source, created_at, updated_at
+        ) VALUES (
+            :ts_code, :trade_date, :suspend_date, :resume_date, :suspend_type,
+            :suspend_reason, :ann_date, :reason_type, :source, :created_at, :updated_at
+        )
+        ON CONFLICT(ts_code, trade_date, suspend_type) DO UPDATE SET
+            suspend_date=excluded.suspend_date,
+            resume_date=excluded.resume_date,
+            suspend_reason=excluded.suspend_reason,
+            ann_date=excluded.ann_date,
+            reason_type=excluded.reason_type,
+            source=excluded.source,
+            updated_at=excluded.updated_at
+        ;
+        """
+        with self.connect() as conn:
+            conn.executemany(sql, x.to_dict("records"))
+            conn.commit()
+
     def upsert_stock_st_event(self, df: pd.DataFrame) -> None:
         if df.empty:
             return
@@ -1051,27 +1180,32 @@ class StockDataStore:
             return
         keep_cols = [
             "ts_code", "trade_date", "is_listed", "is_st", "is_suspended",
-            "has_daily", "has_daily_basic", "has_moneyflow", "days_since_list",
-            "total_mv", "circ_mv", "amount", "close", "is_eligible",
-            "created_at", "updated_at"
+            "is_explicit_suspended", "has_daily", "has_daily_basic", "has_moneyflow",
+            "days_since_list", "total_mv", "circ_mv", "amount", "close",
+            "pre_close", "limit_rate", "up_limit", "down_limit",
+            "is_limit_up", "is_limit_down", "can_buy", "can_sell",
+            "is_eligible", "created_at", "updated_at"
         ]
         x = self._normalize_records(df, keep_cols, "derived")
         sql = """
         INSERT INTO stock_eligibility_daily (
-            ts_code, trade_date, is_listed, is_st, is_suspended,
+            ts_code, trade_date, is_listed, is_st, is_suspended, is_explicit_suspended,
             has_daily, has_daily_basic, has_moneyflow, days_since_list,
-            total_mv, circ_mv, amount, close, is_eligible,
-            created_at, updated_at
+            total_mv, circ_mv, amount, close, pre_close, limit_rate,
+            up_limit, down_limit, is_limit_up, is_limit_down, can_buy, can_sell,
+            is_eligible, created_at, updated_at
         ) VALUES (
-            :ts_code, :trade_date, :is_listed, :is_st, :is_suspended,
+            :ts_code, :trade_date, :is_listed, :is_st, :is_suspended, :is_explicit_suspended,
             :has_daily, :has_daily_basic, :has_moneyflow, :days_since_list,
-            :total_mv, :circ_mv, :amount, :close, :is_eligible,
-            :created_at, :updated_at
+            :total_mv, :circ_mv, :amount, :close, :pre_close, :limit_rate,
+            :up_limit, :down_limit, :is_limit_up, :is_limit_down, :can_buy, :can_sell,
+            :is_eligible, :created_at, :updated_at
         )
         ON CONFLICT(ts_code, trade_date) DO UPDATE SET
             is_listed=excluded.is_listed,
             is_st=excluded.is_st,
             is_suspended=excluded.is_suspended,
+            is_explicit_suspended=excluded.is_explicit_suspended,
             has_daily=excluded.has_daily,
             has_daily_basic=excluded.has_daily_basic,
             has_moneyflow=excluded.has_moneyflow,
@@ -1080,6 +1214,14 @@ class StockDataStore:
             circ_mv=excluded.circ_mv,
             amount=excluded.amount,
             close=excluded.close,
+            pre_close=excluded.pre_close,
+            limit_rate=excluded.limit_rate,
+            up_limit=excluded.up_limit,
+            down_limit=excluded.down_limit,
+            is_limit_up=excluded.is_limit_up,
+            is_limit_down=excluded.is_limit_down,
+            can_buy=excluded.can_buy,
+            can_sell=excluded.can_sell,
             is_eligible=excluded.is_eligible,
             updated_at=excluded.updated_at
         ;
@@ -1271,6 +1413,51 @@ class StockDataStore:
         end_date: Optional[str] = None,
     ) -> pd.DataFrame:
         return self.get_table("stock_st_daily", ts_codes, trade_date, start_date, end_date)
+
+    def get_stock_suspend_daily(
+        self,
+        ts_codes: Optional[list[str]] = None,
+        trade_date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> pd.DataFrame:
+        return self.get_table("stock_suspend_daily", ts_codes, trade_date, start_date, end_date)
+
+    def get_missing_trade_status(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        where = [
+            "(is_suspended IS NULL OR is_limit_up IS NULL OR is_limit_down IS NULL "
+            "OR can_buy IS NULL OR can_sell IS NULL)"
+        ]
+        params: list[Any] = []
+        if start_date:
+            where.append("trade_date >= ?")
+            params.append(start_date)
+        if end_date:
+            where.append("trade_date <= ?")
+            params.append(end_date)
+
+        sql = "SELECT * FROM stock_eligibility_daily WHERE " + " AND ".join(where)
+        sql += " ORDER BY trade_date, ts_code"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self.connect() as conn:
+            return pd.read_sql_query(sql, conn, params=params)
+
+    def get_missing_trade_status_dates(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> list[str]:
+        df = self.get_missing_trade_status(start_date=start_date, end_date=end_date)
+        if df.empty:
+            return []
+        return sorted(df["trade_date"].astype(str).unique().tolist())
 
     def get_stock_st_event(
         self,
@@ -1598,6 +1785,24 @@ class StockDataManager:
             empty_is_success=True,
         )
 
+    def backfill_stock_suspend_daily(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        show_progress: bool = True,
+        skip_existing: bool = True,
+    ) -> dict[str, int]:
+        return self._run_trade_date_backfill(
+            table_name="stock_suspend_daily",
+            fetcher=self.client.fetch_suspend_d_by_trade_date,
+            saver=self.store.upsert_stock_suspend_daily,
+            start_date=start_date,
+            end_date=end_date,
+            show_progress=show_progress,
+            skip_existing=skip_existing,
+            empty_is_success=True,
+        )
+
     def backfill_stock_factor_pro(
         self,
         start_date: Optional[str] = None,
@@ -1666,6 +1871,18 @@ class StockDataManager:
 
     # -------- 最新维护 --------
 
+    def _resolve_latest_open_trade_date(self, trade_date: Optional[str] = None) -> str:
+        if trade_date is not None:
+            return ensure_yyyymmdd(trade_date)
+        open_dates = self.store.get_open_trade_dates(
+            exchange=self.config.default_exchange,
+            start_date=self.config.default_start_date,
+            end_date=today_str(),
+        )
+        if not open_dates:
+            raise ValueError("交易日历为空，请先初始化。")
+        return open_dates[-1]
+
     def _update_latest_trade_date_table(
         self,
         *,
@@ -1674,15 +1891,7 @@ class StockDataManager:
         saver: Callable[[pd.DataFrame], None],
         trade_date: Optional[str] = None,
     ) -> dict[str, int]:
-        if trade_date is None:
-            open_dates = self.store.get_open_trade_dates(
-                exchange=self.config.default_exchange,
-                start_date=self.config.default_start_date,
-                end_date=today_str(),
-            )
-            if not open_dates:
-                raise ValueError("交易日历为空，请先初始化。")
-            trade_date = open_dates[-1]
+        trade_date = self._resolve_latest_open_trade_date(trade_date)
         df = fetcher(trade_date)
         if not df.empty:
             saver(df)
@@ -1752,24 +1961,90 @@ class StockDataManager:
             trade_date=trade_date,
         )
 
+    def update_latest_stock_suspend_daily(
+        self,
+        trade_date: Optional[str] = None,
+        *,
+        raise_on_error: bool = False,
+    ) -> dict[str, int]:
+        trade_date_resolved = self._resolve_latest_open_trade_date(trade_date)
+        try:
+            return self._update_latest_trade_date_table(
+                table_name="stock_suspend_daily",
+                fetcher=self.client.fetch_suspend_d_by_trade_date,
+                saver=self.store.upsert_stock_suspend_daily,
+                trade_date=trade_date_resolved,
+            )
+        except Exception as exc:
+            # suspend_d 是增强停牌判断源。如果接口权限/限流异常，不阻断日常行情更新；
+            # 后续 eligibility 仍会用“上市但无 daily 行情”识别停牌。
+            self.store.set_ingestion_state(
+                table_name="stock_suspend_daily",
+                key_type="trade_date",
+                key_value=trade_date_resolved,
+                status="warning",
+                row_count=0,
+                message=str(exc),
+            )
+            self.store.log_update(
+                table_name="stock_suspend_daily",
+                key_type="trade_date",
+                key_value=trade_date_resolved,
+                row_count=0,
+                status="warning",
+                message=f"suspend_d failed: {exc}",
+            )
+            if raise_on_error:
+                raise
+            return {
+                "trade_date": trade_date_resolved,
+                "inserted_rows": 0,
+                "status": "warning",
+                "message": str(exc),
+            }
+
     def update_latest_all(
         self,
         trade_date: Optional[str] = None,
         include_factor_pro: bool = True,
         include_moneyflow: bool = True,
         include_st_daily: bool = True,
+        include_suspend_daily: bool = True,
+        build_eligibility: bool = True,
+        validate_trade_status: bool = True,
     ) -> dict[str, dict[str, int]]:
+        trade_date_resolved = self._resolve_latest_open_trade_date(trade_date)
         out = {
-            "stock_daily_raw": self.update_latest_stock_daily(trade_date=trade_date),
-            "stock_adj_factor": self.update_latest_stock_adj_factor(trade_date=trade_date),
-            "stock_daily_basic": self.update_latest_stock_daily_basic(trade_date=trade_date),
+            "stock_daily_raw": self.update_latest_stock_daily(trade_date=trade_date_resolved),
+            "stock_adj_factor": self.update_latest_stock_adj_factor(trade_date=trade_date_resolved),
+            "stock_daily_basic": self.update_latest_stock_daily_basic(trade_date=trade_date_resolved),
         }
         if include_moneyflow:
-            out["stock_moneyflow"] = self.update_latest_stock_moneyflow(trade_date=trade_date)
+            out["stock_moneyflow"] = self.update_latest_stock_moneyflow(trade_date=trade_date_resolved)
         if include_st_daily:
-            out["stock_st_daily"] = self.update_latest_stock_st_daily(trade_date=trade_date)
+            out["stock_st_daily"] = self.update_latest_stock_st_daily(trade_date=trade_date_resolved)
+        if include_suspend_daily:
+            out["stock_suspend_daily"] = self.update_latest_stock_suspend_daily(trade_date=trade_date_resolved)
         if include_factor_pro:
-            out["stock_factor_pro"] = self.update_latest_stock_factor_pro(trade_date=trade_date)
+            out["stock_factor_pro"] = self.update_latest_stock_factor_pro(trade_date=trade_date_resolved)
+        if build_eligibility:
+            out["stock_eligibility_daily"] = self.build_eligibility_daily(
+                start_date=trade_date_resolved,
+                end_date=trade_date_resolved,
+                show_progress=False,
+                skip_existing=False,
+            )
+        if validate_trade_status:
+            missing = self.check_missing_trade_status(
+                start_date=trade_date_resolved,
+                end_date=trade_date_resolved,
+                limit=5,
+            )
+            out["trade_status_check"] = {
+                "trade_date": trade_date_resolved,
+                "missing_rows_sampled": int(len(missing)),
+                "status": "success" if len(missing) == 0 else "warning",
+            }
         return out
 
     # -------- 价格口径 --------
@@ -1843,6 +2118,49 @@ class StockDataManager:
 
     # -------- eligibility / 资产池辅助 --------
 
+    def check_missing_trade_status(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        检查 stock_eligibility_daily 中交易状态字段是否仍有缺失。
+        主要用于旧库 schema 迁移后确认历史行是否已重建，也用于每日更新后的完整性检查。
+        """
+        return self.store.get_missing_trade_status(
+            start_date=start_date,
+            end_date=end_date,
+            limit=limit,
+        )
+
+    @staticmethod
+    def _calc_limit_rate(base: pd.DataFrame) -> pd.Series:
+        """
+        根据 A 股常见涨跌幅规则生成日涨跌幅限制。
+
+        说明：
+        - ST：5%
+        - 科创板 / 创业板：20%
+        - 北交所：30%
+        - 其他主板普通股票：10%
+        新股特殊无涨跌幅阶段建议通过 min_list_days 从研究池剔除；这里仍给出常规规则。
+        """
+        code = base["ts_code"].astype(str)
+        symbol = code.str.split(".").str[0]
+        exchange_suffix = code.str.split(".").str[-1].str.upper()
+        exchange_col = base.get("exchange", pd.Series("", index=base.index)).fillna("").astype(str).str.upper()
+
+        rate = pd.Series(0.10, index=base.index, dtype=float)
+        is_st = base.get("is_st", pd.Series(0, index=base.index)).fillna(0).astype(int).eq(1)
+        is_bj = exchange_suffix.eq("BJ") | exchange_col.eq("BSE") | symbol.str.startswith(("4", "8", "920"))
+        is_20pct = symbol.str.startswith(("300", "301", "688", "689"))
+
+        rate.loc[is_20pct] = 0.20
+        rate.loc[is_bj] = 0.30
+        rate.loc[is_st] = 0.05
+        return rate
+
     def build_eligibility_daily(
         self,
         start_date: Optional[str] = None,
@@ -1866,7 +2184,9 @@ class StockDataManager:
             end_date=end_date,
         )
         if skip_existing:
-            trade_dates = self.store.get_missing_trade_dates("stock_eligibility_daily", trade_dates)
+            missing_dates = set(self.store.get_missing_trade_dates("stock_eligibility_daily", trade_dates))
+            incomplete_dates = set(self.store.get_missing_trade_status_dates(start_date=start_date, end_date=end_date))
+            trade_dates = [d for d in trade_dates if d in missing_dates or d in incomplete_dates]
 
         stocks = self.store.get_stocks()
         if stocks.empty:
@@ -1886,7 +2206,14 @@ class StockDataManager:
 
         for trade_date in iterator:
             dt = pd.to_datetime(trade_date, format="%Y%m%d")
-            base = stocks[["ts_code", "list_date", "delist_date"]].copy()
+            base_cols = [
+                "ts_code", "list_date", "delist_date", "market", "exchange",
+                "list_status", "name"
+            ]
+            for c in base_cols:
+                if c not in stocks.columns:
+                    stocks[c] = np.nan
+            base = stocks[base_cols].copy()
             base["trade_date"] = trade_date
             base["is_listed"] = (
                 (base["list_date"].notna()) &
@@ -1903,17 +2230,35 @@ class StockDataManager:
             basic = self.store.get_stock_daily_basic(trade_date=trade_date)
             mf = self.store.get_stock_moneyflow(trade_date=trade_date)
             st_df = self.store.get_stock_st_daily(trade_date=trade_date)
+            suspend_df = self.store.get_stock_suspend_daily(trade_date=trade_date)
 
-            base = base.merge(
-                daily[["ts_code", "amount", "close"]].assign(has_daily=1),
-                on="ts_code",
-                how="left",
-            )
-            base = base.merge(
-                basic[["ts_code", "total_mv", "circ_mv"]].assign(has_daily_basic=1),
-                on="ts_code",
-                how="left",
-            )
+            if not daily.empty:
+                daily_cols = ["ts_code", "amount", "close", "pre_close"]
+                for c in daily_cols:
+                    if c not in daily.columns:
+                        daily[c] = np.nan
+                base = base.merge(
+                    daily[daily_cols].assign(has_daily=1),
+                    on="ts_code",
+                    how="left",
+                )
+            else:
+                base["amount"] = np.nan
+                base["close"] = np.nan
+                base["pre_close"] = np.nan
+                base["has_daily"] = np.nan
+
+            if not basic.empty:
+                base = base.merge(
+                    basic[["ts_code", "total_mv", "circ_mv"]].assign(has_daily_basic=1),
+                    on="ts_code",
+                    how="left",
+                )
+            else:
+                base["total_mv"] = np.nan
+                base["circ_mv"] = np.nan
+                base["has_daily_basic"] = np.nan
+
             if not mf.empty:
                 base = base.merge(
                     mf[["ts_code"]].drop_duplicates().assign(has_moneyflow=1),
@@ -1932,13 +2277,67 @@ class StockDataManager:
             else:
                 base["is_st"] = np.nan
 
+            if not suspend_df.empty:
+                suspend_s = suspend_df[
+                    suspend_df.get("suspend_type", "S").astype(str).str.upper().eq("S")
+                ] if "suspend_type" in suspend_df.columns else suspend_df
+                base = base.merge(
+                    suspend_s[["ts_code"]].drop_duplicates().assign(is_explicit_suspended=1),
+                    on="ts_code",
+                    how="left",
+                )
+            else:
+                base["is_explicit_suspended"] = np.nan
+
             base["has_daily"] = base["has_daily"].fillna(0).astype(int)
             base["has_daily_basic"] = base["has_daily_basic"].fillna(0).astype(int)
             base["has_moneyflow"] = base["has_moneyflow"].fillna(0).astype(int)
             base["is_st"] = base["is_st"].fillna(0).astype(int)
-            base["is_suspended"] = np.where(base["is_listed"].eq(1) & base["has_daily"].eq(0), 1, 0)
+            base["is_explicit_suspended"] = base["is_explicit_suspended"].fillna(0).astype(int)
 
-            eligible = base["is_listed"].eq(1) & base["days_since_list"].fillna(-1).ge(min_list_days) & base["has_daily"].eq(1)
+            # 停牌状态采用双保险：suspend_d 显式停牌 OR 上市但当日无 daily 行情。
+            base["is_suspended"] = np.where(
+                base["is_listed"].eq(1) & (
+                    base["has_daily"].eq(0) | base["is_explicit_suspended"].eq(1)
+                ),
+                1,
+                0,
+            ).astype(int)
+
+            base["limit_rate"] = self._calc_limit_rate(base)
+            close = pd.to_numeric(base["close"], errors="coerce")
+            pre_close = pd.to_numeric(base["pre_close"], errors="coerce")
+            limit_rate = pd.to_numeric(base["limit_rate"], errors="coerce")
+            valid_price = base["has_daily"].eq(1) & close.gt(0) & pre_close.gt(0) & limit_rate.gt(0)
+
+            base["up_limit"] = np.where(valid_price, np.round(pre_close * (1.0 + limit_rate), 2), np.nan)
+            base["down_limit"] = np.where(valid_price, np.round(pre_close * (1.0 - limit_rate), 2), np.nan)
+            up_limit = pd.to_numeric(base["up_limit"], errors="coerce")
+            down_limit = pd.to_numeric(base["down_limit"], errors="coerce")
+
+            price_eps = 0.005
+            base["is_limit_up"] = np.where(valid_price & close.ge(up_limit - price_eps), 1, 0).astype(int)
+            base["is_limit_down"] = np.where(valid_price & close.le(down_limit + price_eps), 1, 0).astype(int)
+
+            base["can_buy"] = np.where(
+                base["is_listed"].eq(1) & base["has_daily"].eq(1) &
+                base["is_suspended"].eq(0) & base["is_limit_up"].eq(0),
+                1,
+                0,
+            ).astype(int)
+            base["can_sell"] = np.where(
+                base["is_listed"].eq(1) & base["has_daily"].eq(1) &
+                base["is_suspended"].eq(0) & base["is_limit_down"].eq(0),
+                1,
+                0,
+            ).astype(int)
+
+            eligible = (
+                base["is_listed"].eq(1) &
+                base["days_since_list"].fillna(-1).ge(min_list_days) &
+                base["has_daily"].eq(1) &
+                base["is_suspended"].eq(0)
+            )
             if require_daily_basic:
                 eligible &= base["has_daily_basic"].eq(1)
             if require_moneyflow:
@@ -1958,9 +2357,11 @@ class StockDataManager:
 
             out_cols = [
                 "ts_code", "trade_date", "is_listed", "is_st", "is_suspended",
-                "has_daily", "has_daily_basic", "has_moneyflow", "days_since_list",
-                "total_mv", "circ_mv", "amount", "close", "is_eligible",
-                "created_at", "updated_at"
+                "is_explicit_suspended", "has_daily", "has_daily_basic", "has_moneyflow",
+                "days_since_list", "total_mv", "circ_mv", "amount", "close",
+                "pre_close", "limit_rate", "up_limit", "down_limit",
+                "is_limit_up", "is_limit_down", "can_buy", "can_sell",
+                "is_eligible", "created_at", "updated_at"
             ]
             out = base[out_cols].copy()
             self.store.upsert_stock_eligibility_daily(out)
@@ -1970,7 +2371,12 @@ class StockDataManager:
                 key_value=trade_date,
                 row_count=len(out),
                 status="success",
-                message=f"eligible={int(out['is_eligible'].sum())}",
+                message=(
+                    f"eligible={int(out['is_eligible'].sum())}, "
+                    f"suspended={int(out['is_suspended'].sum())}, "
+                    f"limit_up={int(out['is_limit_up'].sum())}, "
+                    f"limit_down={int(out['is_limit_down'].sum())}"
+                ),
             )
             summary["success_count"] += 1
             summary["inserted_rows"] += len(out)
@@ -2013,9 +2419,17 @@ class StockDataManager:
         if include_basic:
             basic = self.store.get_stock_daily_basic(trade_date=trade_date)
             if not basic.empty:
+                basic_merge = basic.drop(columns=["source", "created_at", "updated_at"], errors="ignore").copy()
+                join_keys = ["ts_code", "trade_date"] if "trade_date" in out.columns else ["ts_code"]
+                duplicate_cols = [
+                    c for c in basic_merge.columns
+                    if c in out.columns and c not in join_keys
+                ]
+                if duplicate_cols:
+                    basic_merge = basic_merge.drop(columns=duplicate_cols)
                 out = out.merge(
-                    basic.drop(columns=["source", "created_at", "updated_at"], errors="ignore"),
-                    on=["ts_code", "trade_date"] if "trade_date" in out.columns else ["ts_code"],
+                    basic_merge,
+                    on=join_keys,
                     how="left",
                 )
 
@@ -2040,9 +2454,18 @@ class StockDataManager:
         if include_eligibility:
             elig = self.store.get_stock_eligibility_daily(trade_date=trade_date)
             if not elig.empty:
+                elig_merge = elig.drop(columns=["created_at", "updated_at"], errors="ignore").copy()
+                join_keys = ["ts_code", "trade_date"] if "trade_date" in out.columns else ["ts_code"]
+                # 避免 close / amount / pre_close 等事实字段与前面 daily/basic 合并后产生 _x/_y。
+                duplicate_cols = [
+                    c for c in elig_merge.columns
+                    if c in out.columns and c not in join_keys
+                ]
+                if duplicate_cols:
+                    elig_merge = elig_merge.drop(columns=duplicate_cols)
                 out = out.merge(
-                    elig.drop(columns=["created_at", "updated_at"], errors="ignore"),
-                    on=["ts_code", "trade_date"] if "trade_date" in out.columns else ["ts_code"],
+                    elig_merge,
+                    on=join_keys,
                     how="left",
                 )
 
@@ -2080,6 +2503,7 @@ class StockDataManager:
         include_factor_pro: bool = True,
         include_moneyflow: bool = True,
         include_st_daily: bool = True,
+        include_suspend_daily: bool = True,
         build_eligibility: bool = True,
         show_progress: bool = True,
     ) -> dict[str, Any]:
@@ -2120,6 +2544,13 @@ class StockDataManager:
             )
         if include_st_daily:
             result["stock_st_daily"] = self.backfill_stock_st_daily(
+                start_date=start_date,
+                end_date=end_date,
+                show_progress=show_progress,
+                skip_existing=True,
+            )
+        if include_suspend_daily:
+            result["stock_suspend_daily"] = self.backfill_stock_suspend_daily(
                 start_date=start_date,
                 end_date=end_date,
                 show_progress=show_progress,
