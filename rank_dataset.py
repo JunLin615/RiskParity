@@ -594,8 +594,10 @@ class CrossSectionRankDataset(Dataset):
 
         raw_dates = sorted(self.valid_codes_by_date.keys()) if signal_dates is None else sorted(pd.Timestamp(x) for x in signal_dates)
 
+        # History availability must be checked against the full feature date
+        # index, not only the current subset of train/valid signal dates.
         self.signal_dates = filter_signal_dates(
-            all_dates=raw_dates,
+            all_dates=self.all_feature_dates,
             valid_codes_by_date=self.valid_codes_by_date,
             min_valid_stocks=int(min_valid),
             seq_len=int(config.seq_len),
