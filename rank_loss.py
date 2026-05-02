@@ -372,9 +372,16 @@ def rank_ic(
     mask: Optional[torch.Tensor] = None,
     eps: float = EPS,
 ) -> torch.Tensor:
-    """Spearman-like RankIC using hard ranks, returned per batch item."""
-    p, was_1d = _ensure_2d(pred)
-    t, _ = _ensure_2d(target)
+    """
+    Spearman-like RankIC using hard ranks, returned per batch item.
+
+    Important:
+        This metric always uses float32 internally. Under AMP, model scores may
+        be float16. Hard ranks can be as large as N=512, and their squared
+        deviations can overflow in float16 when computing correlation.
+    """
+    p, was_1d = _ensure_2d(pred.detach().float())
+    t, _ = _ensure_2d(target.detach().float())
 
     if mask is not None:
         m, _ = _ensure_2d(mask.bool())
@@ -386,12 +393,18 @@ def rank_ic(
     for b in range(p.shape[0]):
         valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(t[b])
         if valid.sum() < 2:
-            out.append(torch.tensor(0.0, device=p.device, dtype=p.dtype))
+            out.append(torch.tensor(0.0, device=p.device, dtype=torch.float32))
             continue
 
-        pr = torch.argsort(torch.argsort(p[b, valid].float())).to(dtype=p.dtype)
-        tr = torch.argsort(torch.argsort(t[b, valid].float())).to(dtype=p.dtype)
-        corr = masked_pearson_corr(pr, tr, eps=eps)
+        pb = p[b, valid]
+        tb = t[b, valid]
+
+        # Hard ordinal ranks. This is sufficient for monitoring RankIC.
+        # The tensors are float32 to avoid fp16 overflow in variance/covariance.
+        pr = torch.argsort(torch.argsort(pb)).float()
+        tr = torch.argsort(torch.argsort(tb)).float()
+
+        corr = masked_pearson_corr(pr, tr, eps=eps).float()
         out.append(corr)
 
     result = torch.stack(out)
