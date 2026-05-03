@@ -214,6 +214,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-every-steps", type=int, default=None)
     parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=None)
 
+    # TensorBoard
+    parser.add_argument("--use-tensorboard", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--tensorboard-dirname", type=str, default=None)
+    parser.add_argument("--tb-log-every-steps", type=int, default=None)
+    parser.add_argument("--tb-log-memory-every-steps", type=int, default=None)
+    parser.add_argument("--tb-log-grad-norm", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--tb-log-epoch-metrics", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--tb-log-config-text", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--tb-log-histograms", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--tb-histogram-every-epochs", type=int, default=None)
+
     return parser
 
 
@@ -264,6 +275,15 @@ def main() -> None:
         "early_stopping_patience": pick(args, cfg, "early_stopping_patience", 10),
         "log_every_steps": pick(args, cfg, "log_every_steps", 50),
         "use_amp": pick(args, cfg, "use_amp", False),
+        "use_tensorboard": pick(args, cfg, "use_tensorboard", True),
+        "tensorboard_dirname": pick(args, cfg, "tensorboard_dirname", "tensorboard"),
+        "tb_log_every_steps": pick(args, cfg, "tb_log_every_steps", 50),
+        "tb_log_memory_every_steps": pick(args, cfg, "tb_log_memory_every_steps", 10),
+        "tb_log_grad_norm": pick(args, cfg, "tb_log_grad_norm", True),
+        "tb_log_epoch_metrics": pick(args, cfg, "tb_log_epoch_metrics", True),
+        "tb_log_config_text": pick(args, cfg, "tb_log_config_text", True),
+        "tb_log_histograms": pick(args, cfg, "tb_log_histograms", False),
+        "tb_histogram_every_epochs": pick(args, cfg, "tb_histogram_every_epochs", 5),
     }
 
     full_run_config = {
@@ -346,6 +366,15 @@ def main() -> None:
         early_stopping_patience=train_params["early_stopping_patience"],
         log_every_steps=int(train_params["log_every_steps"]),
         use_amp=bool(train_params["use_amp"]),
+        use_tensorboard=bool(train_params["use_tensorboard"]),
+        tensorboard_dirname=str(train_params["tensorboard_dirname"]),
+        tb_log_every_steps=int(train_params["tb_log_every_steps"]),
+        tb_log_memory_every_steps=int(train_params["tb_log_memory_every_steps"]),
+        tb_log_grad_norm=bool(train_params["tb_log_grad_norm"]),
+        tb_log_epoch_metrics=bool(train_params["tb_log_epoch_metrics"]),
+        tb_log_config_text=bool(train_params["tb_log_config_text"]),
+        tb_log_histograms=bool(train_params["tb_log_histograms"]),
+        tb_histogram_every_epochs=int(train_params["tb_histogram_every_epochs"]),
     )
 
     print("Starting training...")

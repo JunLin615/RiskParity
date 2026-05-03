@@ -55,5 +55,14 @@
   "device": "auto",
   "seed": 42,
   "early_stopping_patience": 10,
-  "log_every_steps": 50
+  "log_every_steps": 0,
+  "use_tensorboard": true,
+  "tensorboard_dirname": "tensorboard",
+  "tb_log_every_steps": 50,
+  "tb_log_memory_every_steps": 10,
+  "tb_log_grad_norm": true,
+  "tb_log_epoch_metrics": true,
+  "tb_log_config_text": true,
+  "tb_log_histograms": false,
+  "tb_histogram_every_epochs": 5
 }

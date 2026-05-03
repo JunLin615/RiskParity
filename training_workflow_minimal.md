@@ -338,6 +338,10 @@ checkpoints/dual_transformer_ranker/
     last.pt
     run_summary.json
 
+cmd中去checkpoints中对应当此训练的目录下，
+tensorboard --logdir checkpoints/dual_transformer_ranker
+
+tensorboard看训练监测。
 ## 8. 实验记录模板
 
 每次训练后复制一份。
