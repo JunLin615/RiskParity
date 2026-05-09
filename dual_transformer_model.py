@@ -1,56 +1,17 @@
 """
-dual_transformer_model.py
+dual_transformer_model_v2.py
 
-Dual-Transformer architecture for cross-sectional ranking.
+Dual-Transformer V2 for cross-sectional ranking.
 
-Architecture
-------------
-Input tensors from rank_dataset.py:
-
-    x_ts:     [B, N, F_ts, T] or [N, F_ts, T]
-    x_scalar: [B, N, F_sc]    or [N, F_sc]
-
-where:
-    B    = outer DataLoader batch size
-    N    = number of stocks in one cross-section, e.g. 512
-    F_ts = number of time-series factors
-    F_sc = number of scalar factors
-    T    = sequence length, e.g. 128
-
-Main stages:
-1. Temporal factor encoder:
-    [B, N, F_ts, T]
-        -> reshape [B*N*F_ts, 1, T]
-        -> 1D conv + adaptive pooling
-        -> [B, N, F_ts, D]
-
-2. Scalar factor embedding:
-    [B, N, F_sc]
-        -> independent scalar token embeddings
-        -> [B, N, F_sc, D]
-
-3. Factor-level transformer:
-    concat time-series and scalar factor tokens:
-        [B, N, F_ts + F_sc, D]
-    add CLS token per stock:
-        [B*N, 1 + F_ts + F_sc, D]
-    no positional encoding
-    output stock fingerprint:
-        [B, N, D]
-
-4. Cross-sectional transformer:
-    [B, N, D]
-    no positional encoding
-    output contextualized stock embedding:
-        [B, N, D]
-
-5. Score head:
-    [B, N, D] -> [B, N]
-
-Notes
------
-This file intentionally does not implement the ranking loss. Put losses such as
-Spearman/SoftSort/Pairwise loss in rank_loss.py.
+Changes vs V1:
+1. CNN no longer flattens [stock, factor]. Stocks are batch items and time-series
+   factors are Conv1d input channels: [B,N,F_ts,T] -> [B*N,F_ts,T].
+2. BatchNorm is removed; CNN uses GroupNorm.
+3. CNN channels are hidden temporal-factor tokens: [B,N,C_out,T_comp].
+4. T_comp is the raw token encoding. Optional Linear(T_comp -> model_dim) is
+   used when model_dim is set.
+5. Factor-level attention uses learnable positional embeddings.
+6. Cross-sectional stock attention remains permutation-equivariant, no position.
 """
 
 from __future__ import annotations
@@ -62,32 +23,35 @@ import torch
 from torch import nn
 
 
-# ============================================================
-# Config
-# ============================================================
-
 @dataclass(frozen=True)
 class DualTransformerConfig:
-    """Model hyperparameters."""
-
     num_ts_factors: int
     num_scalar_factors: int
     seq_len: int = 128
 
-    temporal_channels: int = 16
+    # V2 temporal CNN. Defaults follow the user's proposed structure.
+    temporal_hidden_channels: int = 512
+    temporal_out_channels: int = 256
     temporal_compressed_len: int = 32
     temporal_kernel_size: int = 5
     temporal_conv_layers: int = 2
+    group_norm_groups: int = 32
 
+    # Deprecated V1 compatibility. Accepted to avoid breaking old config files.
+    temporal_channels: Optional[int] = None
+
+    # If None, attention dim D = temporal_compressed_len.
+    # If set, raw T_comp token encodings are projected to model_dim.
     model_dim: Optional[int] = None
 
     factor_num_layers: int = 1
-    factor_num_heads: int = 8
-    factor_ff_dim: int = 1024
+    factor_num_heads: int = 4
+    factor_ff_dim: int = 256
+    factor_use_positional_encoding: bool = True
 
     cross_num_layers: int = 1
-    cross_num_heads: int = 8
-    cross_ff_dim: int = 1024
+    cross_num_heads: int = 4
+    cross_ff_dim: int = 256
 
     dropout: float = 0.1
     activation: str = "gelu"
@@ -100,19 +64,11 @@ class DualTransformerConfig:
     output_squeeze_batch_if_unbatched: bool = True
 
     def resolved_model_dim(self) -> int:
-        """Return D. By default D = temporal_channels * temporal_compressed_len."""
-        if self.model_dim is not None:
-            return int(self.model_dim)
-        return int(self.temporal_channels) * int(self.temporal_compressed_len)
+        return int(self.temporal_compressed_len if self.model_dim is None else self.model_dim)
 
-    def temporal_flat_dim(self) -> int:
-        """Return temporal encoder flat dimension before optional projection."""
-        return int(self.temporal_channels) * int(self.temporal_compressed_len)
+    def factor_token_count(self) -> int:
+        return int(self.temporal_out_channels) + int(self.num_scalar_factors)
 
-
-# ============================================================
-# Small utilities
-# ============================================================
 
 def _activation(name: str) -> nn.Module:
     name = str(name).lower()
@@ -120,21 +76,24 @@ def _activation(name: str) -> nn.Module:
         return nn.GELU()
     if name == "relu":
         return nn.ReLU()
-    if name == "silu" or name == "swish":
+    if name in {"silu", "swish"}:
         return nn.SiLU()
     raise ValueError(f"unsupported activation: {name!r}")
 
 
-def _validate_positive(name: str, value: int) -> None:
-    if int(value) < 0:
-        raise ValueError(f"{name} must be non-negative, got {value}")
+def _largest_valid_group_count(num_channels: int, requested_groups: int) -> int:
+    c = int(num_channels)
+    g = min(max(1, int(requested_groups)), c)
+    while g > 1:
+        if c % g == 0:
+            return g
+        g -= 1
+    return 1
 
 
-def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
-    """Count model parameters."""
-    if trainable_only:
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return sum(p.numel() for p in model.parameters())
+def _make_group_norm(num_channels: int, requested_groups: int) -> nn.GroupNorm:
+    groups = _largest_valid_group_count(num_channels, requested_groups)
+    return nn.GroupNorm(num_groups=groups, num_channels=int(num_channels))
 
 
 def _make_encoder_layer(
@@ -145,161 +104,120 @@ def _make_encoder_layer(
     activation: str,
     norm_first: bool,
 ) -> nn.TransformerEncoderLayer:
-    if model_dim % num_heads != 0:
+    if int(model_dim) % int(num_heads) != 0:
         raise ValueError(f"model_dim={model_dim} must be divisible by num_heads={num_heads}")
-
     return nn.TransformerEncoderLayer(
-        d_model=model_dim,
-        nhead=num_heads,
-        dim_feedforward=ff_dim,
-        dropout=dropout,
-        activation=activation,
+        d_model=int(model_dim),
+        nhead=int(num_heads),
+        dim_feedforward=int(ff_dim),
+        dropout=float(dropout),
+        activation=str(activation),
         batch_first=True,
-        norm_first=norm_first,
+        norm_first=bool(norm_first),
     )
 
 
-def _make_transformer_encoder(
-    encoder_layer: nn.TransformerEncoderLayer,
-    num_layers: int,
-) -> nn.TransformerEncoder:
-    """
-    Construct TransformerEncoder while avoiding nested-tensor warnings in
-    PyTorch versions that support enable_nested_tensor.
-    """
+def _make_transformer_encoder(layer: nn.TransformerEncoderLayer, num_layers: int) -> nn.TransformerEncoder:
     try:
-        return nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=int(num_layers),
-            enable_nested_tensor=False,
-        )
+        return nn.TransformerEncoder(layer, num_layers=int(num_layers), enable_nested_tensor=False)
     except TypeError:
-        return nn.TransformerEncoder(encoder_layer, num_layers=int(num_layers))
+        return nn.TransformerEncoder(layer, num_layers=int(num_layers))
 
 
-# ============================================================
-# Temporal encoder
-# ============================================================
+def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
 
-class TemporalFactorEncoder(nn.Module):
+
+class CrossFactorTemporalEncoder(nn.Module):
     """
-    Encode each time-series factor independently.
+    Treat factors as Conv1d input channels and stocks as batch items.
 
-    Input:
-        x_ts: [B, N, F_ts, T]
-
-    Output:
-        tokens: [B, N, F_ts, D]
+    Input:  x_ts [B,N,F_ts,T]
+    Output: raw tokens [B,N,C_out,T_comp]
     """
 
     def __init__(self, config: DualTransformerConfig) -> None:
         super().__init__()
-
-        _validate_positive("num_ts_factors", config.num_ts_factors)
+        self.config = config
         if config.num_ts_factors <= 0:
-            raise ValueError("num_ts_factors must be positive for TemporalFactorEncoder")
-        if config.seq_len <= 0:
-            raise ValueError("seq_len must be positive")
-        if config.temporal_channels <= 0:
-            raise ValueError("temporal_channels must be positive")
+            raise ValueError("num_ts_factors must be positive")
+        if config.temporal_hidden_channels <= 0 or config.temporal_out_channels <= 0:
+            raise ValueError("temporal channels must be positive")
         if config.temporal_compressed_len <= 0:
             raise ValueError("temporal_compressed_len must be positive")
-        if config.temporal_conv_layers <= 0:
-            raise ValueError("temporal_conv_layers must be positive")
+        if config.temporal_conv_layers < 1:
+            raise ValueError("temporal_conv_layers must be >= 1")
 
-        self.config = config
-        c = int(config.temporal_channels)
         k = int(config.temporal_kernel_size)
-        padding = k // 2
+        pad = k // 2
+        hidden = int(config.temporal_hidden_channels)
+        out_ch = int(config.temporal_out_channels)
+        groups = int(config.group_norm_groups)
 
-        layers: list[nn.Module] = []
-
-        # First layer maps one single-factor channel to C channels.
-        layers.extend([
-            nn.Conv1d(1, c, kernel_size=k, padding=padding),
-            nn.BatchNorm1d(c),
+        layers: list[nn.Module] = [
+            nn.Conv1d(int(config.num_ts_factors), hidden, kernel_size=k, padding=pad),
+            _make_group_norm(hidden, groups),
             _activation(config.activation),
-            nn.Dropout(config.dropout),
-        ])
-
-        # Additional depthwise-separable style blocks.
+            nn.Dropout(float(config.dropout)),
+        ]
         for _ in range(int(config.temporal_conv_layers) - 1):
-            layers.extend([
-                nn.Conv1d(c, c, kernel_size=k, padding=padding, groups=c),
-                nn.Conv1d(c, c, kernel_size=1),
-                nn.BatchNorm1d(c),
+            layers += [
+                nn.Conv1d(hidden, hidden, kernel_size=k, padding=pad),
+                _make_group_norm(hidden, groups),
                 _activation(config.activation),
-                nn.Dropout(config.dropout),
-            ])
-
+                nn.Dropout(float(config.dropout)),
+            ]
+        layers += [
+            nn.Conv1d(hidden, out_ch, kernel_size=1),
+            _make_group_norm(out_ch, groups),
+            _activation(config.activation),
+            nn.Dropout(float(config.dropout)),
+        ]
         self.conv = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool1d(int(config.temporal_compressed_len))
 
-        flat_dim = config.temporal_flat_dim()
-        model_dim = config.resolved_model_dim()
-
-        if flat_dim == model_dim:
-            self.proj = nn.Identity()
-        else:
-            self.proj = nn.Linear(flat_dim, model_dim)
-
-        self.out_norm = nn.LayerNorm(model_dim)
-
     def forward(self, x_ts: torch.Tensor) -> torch.Tensor:
         if x_ts.ndim != 4:
-            raise ValueError(f"x_ts must have shape [B, N, F_ts, T], got {tuple(x_ts.shape)}")
-
+            raise ValueError(f"x_ts must have shape [B,N,F_ts,T], got {tuple(x_ts.shape)}")
         b, n, f_ts, t = x_ts.shape
-        if f_ts != self.config.num_ts_factors:
+        if f_ts != int(self.config.num_ts_factors):
             raise ValueError(f"expected F_ts={self.config.num_ts_factors}, got {f_ts}")
-        if t != self.config.seq_len:
+        if t != int(self.config.seq_len):
             raise ValueError(f"expected T={self.config.seq_len}, got {t}")
-
         if self.config.input_nan_to_num:
             x_ts = torch.nan_to_num(x_ts, nan=0.0, posinf=0.0, neginf=0.0)
-
-        x = x_ts.reshape(b * n * f_ts, 1, t)
-        x = self.conv(x)
-        x = self.pool(x)
-        x = x.flatten(start_dim=1)
-        x = self.proj(x)
-        x = self.out_norm(x)
-        return x.reshape(b, n, f_ts, -1)
+        x = x_ts.reshape(b * n, f_ts, t)
+        x = self.pool(self.conv(x))
+        return x.reshape(b, n, int(self.config.temporal_out_channels), int(self.config.temporal_compressed_len))
 
 
-# ============================================================
-# Scalar embedding
-# ============================================================
+class TemporalTokenProjection(nn.Module):
+    """Project raw T_comp token encodings to model_dim if needed."""
+
+    def __init__(self, compressed_len: int, model_dim: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.proj = nn.Identity() if int(compressed_len) == int(model_dim) else nn.Linear(int(compressed_len), int(model_dim))
+        self.norm = nn.LayerNorm(int(model_dim))
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, raw_tokens: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.norm(self.proj(raw_tokens)))
+
 
 class ScalarFactorEmbedding(nn.Module):
-    """
-    Independently embed scalar factors into factor tokens.
-
-    For each scalar factor j:
-        token_j = value_j * weight_j + bias_j
-
-    Input:
-        x_scalar: [B, N, F_sc]
-
-    Output:
-        tokens: [B, N, F_sc, D]
-    """
+    """Embed scalar factors as scalar tokens aligned to model_dim."""
 
     def __init__(self, num_scalar_factors: int, model_dim: int, dropout: float = 0.1) -> None:
         super().__init__()
-
-        _validate_positive("num_scalar_factors", num_scalar_factors)
-        if model_dim <= 0:
-            raise ValueError("model_dim must be positive")
-
         self.num_scalar_factors = int(num_scalar_factors)
         self.model_dim = int(model_dim)
-
         if self.num_scalar_factors > 0:
             self.weight = nn.Parameter(torch.empty(self.num_scalar_factors, self.model_dim))
             self.bias = nn.Parameter(torch.zeros(self.num_scalar_factors, self.model_dim))
             self.norm = nn.LayerNorm(self.model_dim)
-            self.dropout = nn.Dropout(dropout)
+            self.dropout = nn.Dropout(float(dropout))
             self.reset_parameters()
         else:
             self.register_parameter("weight", None)
@@ -315,347 +233,182 @@ class ScalarFactorEmbedding(nn.Module):
     def forward(self, x_scalar: Optional[torch.Tensor], batch_size: int, num_stocks: int, device: torch.device) -> torch.Tensor:
         if self.num_scalar_factors == 0:
             return torch.empty(batch_size, num_stocks, 0, self.model_dim, device=device)
-
         if x_scalar is None:
             raise ValueError("x_scalar is required because num_scalar_factors > 0")
-
         if x_scalar.ndim != 3:
-            raise ValueError(f"x_scalar must have shape [B, N, F_sc], got {tuple(x_scalar.shape)}")
-
+            raise ValueError(f"x_scalar must have shape [B,N,F_sc], got {tuple(x_scalar.shape)}")
         b, n, f_sc = x_scalar.shape
-        if b != batch_size or n != num_stocks:
-            raise ValueError(
-                f"x_scalar batch/stock dims {tuple(x_scalar.shape[:2])} do not match "
-                f"x_ts dims {(batch_size, num_stocks)}"
-            )
-        if f_sc != self.num_scalar_factors:
-            raise ValueError(f"expected F_sc={self.num_scalar_factors}, got {f_sc}")
-
+        if b != batch_size or n != num_stocks or f_sc != self.num_scalar_factors:
+            raise ValueError(f"x_scalar shape mismatch, got {tuple(x_scalar.shape)}")
         x = torch.nan_to_num(x_scalar, nan=0.0, posinf=0.0, neginf=0.0)
         tokens = x.unsqueeze(-1) * self.weight.view(1, 1, f_sc, self.model_dim)
         tokens = tokens + self.bias.view(1, 1, f_sc, self.model_dim)
-        tokens = self.norm(tokens)
-        tokens = self.dropout(tokens)
-        return tokens
+        return self.dropout(self.norm(tokens))
 
-
-# ============================================================
-# Factor-level attention
-# ============================================================
 
 class FactorLevelTransformer(nn.Module):
-    """
-    Factor-level self-attention inside each stock.
-
-    Input:
-        factor_tokens: [B, N, F_total, D]
-
-    Output:
-        stock_embedding: [B, N, D]
-    """
+    """Factor attention inside each stock, with optional positional embeddings."""
 
     def __init__(self, config: DualTransformerConfig) -> None:
         super().__init__()
-        model_dim = config.resolved_model_dim()
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, model_dim))
-        encoder_layer = _make_encoder_layer(
-            model_dim=model_dim,
-            num_heads=int(config.factor_num_heads),
-            ff_dim=int(config.factor_ff_dim),
-            dropout=float(config.dropout),
-            activation=config.activation,
-            norm_first=bool(config.norm_first),
-        )
-        self.encoder = _make_transformer_encoder(encoder_layer, num_layers=int(config.factor_num_layers))
-        self.out_norm = nn.LayerNorm(model_dim)
+        self.config = config
+        d = config.resolved_model_dim()
+        token_count = 1 + config.factor_token_count()
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d))
+        if config.factor_use_positional_encoding:
+            self.pos_embedding = nn.Parameter(torch.zeros(1, token_count, d))
+        else:
+            self.register_parameter("pos_embedding", None)
+        layer = _make_encoder_layer(d, int(config.factor_num_heads), int(config.factor_ff_dim), float(config.dropout), config.activation, bool(config.norm_first))
+        self.encoder = _make_transformer_encoder(layer, int(config.factor_num_layers))
+        self.out_norm = nn.LayerNorm(d)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        if self.pos_embedding is not None:
+            nn.init.normal_(self.pos_embedding, mean=0.0, std=0.02)
 
     def forward(self, factor_tokens: torch.Tensor) -> torch.Tensor:
         if factor_tokens.ndim != 4:
-            raise ValueError(f"factor_tokens must have shape [B, N, F, D], got {tuple(factor_tokens.shape)}")
-
+            raise ValueError(f"factor_tokens must have shape [B,N,F,D], got {tuple(factor_tokens.shape)}")
         b, n, f_total, d = factor_tokens.shape
         x = factor_tokens.reshape(b * n, f_total, d)
-
         cls = self.cls_token.expand(b * n, -1, -1)
         x = torch.cat([cls, x], dim=1)
-
+        if self.pos_embedding is not None:
+            if x.shape[1] > self.pos_embedding.shape[1]:
+                raise ValueError("token count exceeds positional embedding length")
+            x = x + self.pos_embedding[:, : x.shape[1], :]
         x = self.encoder(x)
-        stock_embedding = x[:, 0, :]
-        stock_embedding = self.out_norm(stock_embedding)
-        return stock_embedding.reshape(b, n, d)
+        return self.out_norm(x[:, 0, :]).reshape(b, n, d)
 
-
-# ============================================================
-# Cross-sectional attention
-# ============================================================
 
 class CrossSectionalTransformer(nn.Module):
-    """
-    Cross-sectional self-attention among stocks.
-
-    Input:
-        stock_embeddings: [B, N, D]
-
-    Optional:
-        stock_valid_mask: [B, N], True for valid stocks, False for padded/invalid.
-
-    Output:
-        contextualized: [B, N, D]
-    """
+    """Stock-level cross-sectional attention, without positional encoding."""
 
     def __init__(self, config: DualTransformerConfig) -> None:
         super().__init__()
-        model_dim = config.resolved_model_dim()
-
-        encoder_layer = _make_encoder_layer(
-            model_dim=model_dim,
-            num_heads=int(config.cross_num_heads),
-            ff_dim=int(config.cross_ff_dim),
-            dropout=float(config.dropout),
-            activation=config.activation,
-            norm_first=bool(config.norm_first),
-        )
-        self.encoder = _make_transformer_encoder(encoder_layer, num_layers=int(config.cross_num_layers))
-        self.out_norm = nn.LayerNorm(model_dim)
+        d = config.resolved_model_dim()
+        layer = _make_encoder_layer(d, int(config.cross_num_heads), int(config.cross_ff_dim), float(config.dropout), config.activation, bool(config.norm_first))
+        self.encoder = _make_transformer_encoder(layer, int(config.cross_num_layers))
+        self.out_norm = nn.LayerNorm(d)
 
     def forward(self, stock_embeddings: torch.Tensor, stock_valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if stock_embeddings.ndim != 3:
-            raise ValueError(
-                f"stock_embeddings must have shape [B, N, D], got {tuple(stock_embeddings.shape)}"
-            )
-
-        src_key_padding_mask = None
+            raise ValueError(f"stock_embeddings must have shape [B,N,D], got {tuple(stock_embeddings.shape)}")
+        key_padding_mask = None
         if stock_valid_mask is not None:
             if stock_valid_mask.shape != stock_embeddings.shape[:2]:
-                raise ValueError(
-                    f"stock_valid_mask shape {tuple(stock_valid_mask.shape)} does not match "
-                    f"[B, N]={tuple(stock_embeddings.shape[:2])}"
-                )
-            # PyTorch expects True for positions to ignore.
-            src_key_padding_mask = ~stock_valid_mask.bool()
+                raise ValueError("stock_valid_mask shape mismatch")
+            key_padding_mask = ~stock_valid_mask.bool()
+        return self.out_norm(self.encoder(stock_embeddings, src_key_padding_mask=key_padding_mask))
 
-        x = self.encoder(stock_embeddings, src_key_padding_mask=src_key_padding_mask)
-        x = self.out_norm(x)
-        return x
-
-
-# ============================================================
-# Score head
-# ============================================================
 
 class ScoreHead(nn.Module):
-    """Map contextualized stock embeddings [B, N, D] to scores [B, N]."""
-
-    def __init__(
-        self,
-        model_dim: int,
-        hidden_dim: Optional[int] = None,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-        activation: str = "gelu",
-    ) -> None:
+    def __init__(self, model_dim: int, hidden_dim: Optional[int] = None, num_layers: int = 2, dropout: float = 0.1, activation: str = "gelu") -> None:
         super().__init__()
-
-        if num_layers < 1:
+        if int(num_layers) < 1:
             raise ValueError("score_head_layers must be >= 1")
-
-        hidden_dim = int(hidden_dim or model_dim)
-
-        layers: list[nn.Module] = [nn.LayerNorm(model_dim)]
-
-        if num_layers == 1:
-            layers.append(nn.Linear(model_dim, 1))
+        hidden = int(hidden_dim or model_dim)
+        layers: list[nn.Module] = [nn.LayerNorm(int(model_dim))]
+        if int(num_layers) == 1:
+            layers.append(nn.Linear(int(model_dim), 1))
         else:
-            in_dim = model_dim
-            for _ in range(num_layers - 1):
-                layers.extend([
-                    nn.Linear(in_dim, hidden_dim),
-                    _activation(activation),
-                    nn.Dropout(dropout),
-                ])
-                in_dim = hidden_dim
+            in_dim = int(model_dim)
+            for _ in range(int(num_layers) - 1):
+                layers += [nn.Linear(in_dim, hidden), _activation(activation), nn.Dropout(float(dropout))]
+                in_dim = hidden
             layers.append(nn.Linear(in_dim, 1))
-
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        score = self.net(x).squeeze(-1)
-        return score
+        return self.net(x).squeeze(-1)
 
-
-# ============================================================
-# Full model
-# ============================================================
 
 class DualTransformerRanker(nn.Module):
-    """
-    Dual-Transformer ranker.
-
-    Forward input:
-        x_ts:     [B, N, F_ts, T] or [N, F_ts, T]
-        x_scalar: [B, N, F_sc]    or [N, F_sc]
-
-    Forward output:
-        scores: [B, N] or [N] if input was unbatched and squeeze is enabled.
-    """
-
     def __init__(self, config: DualTransformerConfig) -> None:
         super().__init__()
-
-        if config.num_ts_factors <= 0:
-            raise ValueError("num_ts_factors must be positive")
-        if config.num_scalar_factors < 0:
-            raise ValueError("num_scalar_factors must be non-negative")
-
         self.config = config
         self.model_dim = config.resolved_model_dim()
-
-        self.temporal_encoder = TemporalFactorEncoder(config)
-        self.scalar_embedding = ScalarFactorEmbedding(
-            num_scalar_factors=int(config.num_scalar_factors),
-            model_dim=self.model_dim,
-            dropout=float(config.dropout),
-        )
+        self.temporal_encoder = CrossFactorTemporalEncoder(config)
+        self.temporal_token_projection = TemporalTokenProjection(config.temporal_compressed_len, self.model_dim, config.dropout)
+        self.scalar_embedding = ScalarFactorEmbedding(config.num_scalar_factors, self.model_dim, config.dropout)
         self.factor_transformer = FactorLevelTransformer(config)
         self.cross_transformer = CrossSectionalTransformer(config)
-        self.score_head = ScoreHead(
-            model_dim=self.model_dim,
-            hidden_dim=config.score_hidden_dim,
-            num_layers=int(config.score_head_layers),
-            dropout=float(config.dropout),
-            activation=config.activation,
-        )
+        self.score_head = ScoreHead(self.model_dim, config.score_hidden_dim, config.score_head_layers, config.dropout, config.activation)
 
     @classmethod
-    def from_feature_counts(
-        cls,
-        num_ts_factors: int,
-        num_scalar_factors: int,
-        seq_len: int = 128,
-        **kwargs: Any,
-    ) -> "DualTransformerRanker":
-        """Convenience constructor from feature counts."""
-        config = DualTransformerConfig(
-            num_ts_factors=int(num_ts_factors),
-            num_scalar_factors=int(num_scalar_factors),
-            seq_len=int(seq_len),
-            **kwargs,
-        )
+    def from_feature_counts(cls, num_ts_factors: int, num_scalar_factors: int, seq_len: int = 128, **kwargs: Any) -> "DualTransformerRanker":
+        config = DualTransformerConfig(int(num_ts_factors), int(num_scalar_factors), int(seq_len), **kwargs)
         return cls(config)
 
-    def _ensure_batched(
-        self,
-        x_ts: torch.Tensor,
-        x_scalar: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
-        """Convert unbatched inputs to batched inputs."""
+    def _ensure_batched(self, x_ts: torch.Tensor, x_scalar: Optional[torch.Tensor]) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
         was_unbatched = False
-
         if x_ts.ndim == 3:
             x_ts = x_ts.unsqueeze(0)
             was_unbatched = True
         elif x_ts.ndim != 4:
             raise ValueError(f"x_ts must have shape [B,N,F_ts,T] or [N,F_ts,T], got {tuple(x_ts.shape)}")
-
         if x_scalar is not None:
             if x_scalar.ndim == 2:
                 x_scalar = x_scalar.unsqueeze(0)
             elif x_scalar.ndim != 3:
-                raise ValueError(
-                    f"x_scalar must have shape [B,N,F_sc] or [N,F_sc], got {tuple(x_scalar.shape)}"
-                )
-
+                raise ValueError(f"x_scalar must have shape [B,N,F_sc] or [N,F_sc], got {tuple(x_scalar.shape)}")
         return x_ts, x_scalar, was_unbatched
 
-    def forward(
-        self,
-        x_ts: torch.Tensor,
-        x_scalar: Optional[torch.Tensor] = None,
-        stock_valid_mask: Optional[torch.Tensor] = None,
-        return_dict: bool = False,
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
+    def forward(self, x_ts: torch.Tensor, x_scalar: Optional[torch.Tensor] = None, stock_valid_mask: Optional[torch.Tensor] = None, return_dict: bool = False) -> torch.Tensor | dict[str, torch.Tensor]:
         x_ts, x_scalar, was_unbatched = self._ensure_batched(x_ts, x_scalar)
-
         b, n, f_ts, t = x_ts.shape
-        if f_ts != self.config.num_ts_factors:
+        if f_ts != int(self.config.num_ts_factors):
             raise ValueError(f"expected F_ts={self.config.num_ts_factors}, got {f_ts}")
-        if t != self.config.seq_len:
+        if t != int(self.config.seq_len):
             raise ValueError(f"expected T={self.config.seq_len}, got {t}")
-
         if stock_valid_mask is not None and stock_valid_mask.ndim == 1:
             stock_valid_mask = stock_valid_mask.unsqueeze(0)
 
-        ts_tokens = self.temporal_encoder(x_ts)
-        scalar_tokens = self.scalar_embedding(
-            x_scalar=x_scalar,
-            batch_size=b,
-            num_stocks=n,
-            device=x_ts.device,
-        )
-
+        raw_ts_tokens = self.temporal_encoder(x_ts)
+        ts_tokens = self.temporal_token_projection(raw_ts_tokens)
+        scalar_tokens = self.scalar_embedding(x_scalar, b, n, x_ts.device)
         factor_tokens = torch.cat([ts_tokens, scalar_tokens], dim=2)
         stock_embedding = self.factor_transformer(factor_tokens)
-        cross_embedding = self.cross_transformer(stock_embedding, stock_valid_mask=stock_valid_mask)
+        cross_embedding = self.cross_transformer(stock_embedding, stock_valid_mask)
         scores = self.score_head(cross_embedding)
-
         if stock_valid_mask is not None:
             scores = scores.masked_fill(~stock_valid_mask.bool(), 0.0)
 
         if was_unbatched and self.config.output_squeeze_batch_if_unbatched:
             scores_out = scores.squeeze(0)
-            stock_embedding_out = stock_embedding.squeeze(0)
-            cross_embedding_out = cross_embedding.squeeze(0)
+            stock_out = stock_embedding.squeeze(0)
+            cross_out = cross_embedding.squeeze(0)
+            raw_out = raw_ts_tokens.squeeze(0)
         else:
             scores_out = scores
-            stock_embedding_out = stock_embedding
-            cross_embedding_out = cross_embedding
-
+            stock_out = stock_embedding
+            cross_out = cross_embedding
+            raw_out = raw_ts_tokens
         if not return_dict:
             return scores_out
+        return {"scores": scores_out, "stock_embedding": stock_out, "cross_embedding": cross_out, "raw_ts_tokens": raw_out}
 
-        return {
-            "scores": scores_out,
-            "stock_embedding": stock_embedding_out,
-            "cross_embedding": cross_embedding_out,
-        }
-
-    def predict_scores(
-        self,
-        x_ts: torch.Tensor,
-        x_scalar: Optional[torch.Tensor] = None,
-        stock_valid_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Inference helper."""
+    def predict_scores(self, x_ts: torch.Tensor, x_scalar: Optional[torch.Tensor] = None, stock_valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         self.eval()
         with torch.no_grad():
-            return self.forward(x_ts=x_ts, x_scalar=x_scalar, stock_valid_mask=stock_valid_mask, return_dict=False)
+            return self.forward(x_ts, x_scalar, stock_valid_mask, return_dict=False)
 
     def get_config_dict(self) -> dict[str, Any]:
-        """Return config as a plain dictionary."""
         return asdict(self.config)
 
 
-# ============================================================
-# Smoke-test helper
-# ============================================================
-
-def make_tiny_model_for_test(
-    num_ts_factors: int = 6,
-    num_scalar_factors: int = 2,
-    seq_len: int = 32,
-) -> DualTransformerRanker:
-    """Create a small model for quick tests."""
+def make_tiny_model_for_test(num_ts_factors: int = 6, num_scalar_factors: int = 2, seq_len: int = 32) -> DualTransformerRanker:
     return DualTransformerRanker.from_feature_counts(
         num_ts_factors=num_ts_factors,
         num_scalar_factors=num_scalar_factors,
         seq_len=seq_len,
-        temporal_channels=4,
+        temporal_hidden_channels=32,
+        temporal_out_channels=8,
         temporal_compressed_len=8,
+        group_norm_groups=4,
         model_dim=32,
         factor_num_layers=1,
         factor_num_heads=4,
@@ -670,7 +423,8 @@ def make_tiny_model_for_test(
 
 __all__ = [
     "DualTransformerConfig",
-    "TemporalFactorEncoder",
+    "CrossFactorTemporalEncoder",
+    "TemporalTokenProjection",
     "ScalarFactorEmbedding",
     "FactorLevelTransformer",
     "CrossSectionalTransformer",
