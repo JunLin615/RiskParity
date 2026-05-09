@@ -203,10 +203,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--grad-clip-norm", type=float, default=None)
-    parser.add_argument("--loss-type", type=str, default=None, choices=["spearman", "pearson", "pairwise"])
+    parser.add_argument("--loss-type", type=str, default=None, choices=["spearman", "pearson", "pairwise", "ndcg", "ndcg_pairwise"])
     parser.add_argument("--tau-start", type=float, default=None)
     parser.add_argument("--tau-end", type=float, default=None)
     parser.add_argument("--tau-decay-epochs", type=int, default=None)
+    parser.add_argument("--ndcg-temperature", type=float, default=None)
+    parser.add_argument("--ndcg-gain-power", type=float, default=None)
+    parser.add_argument("--ndcg-max-pairs", type=int, default=None)
+    parser.add_argument("--l2-lambda", type=float, default=None)
+    parser.add_argument("--l2-exclude-bias-norm", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--topk-metric-k", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -269,6 +274,11 @@ def main() -> None:
         "tau_start": pick(args, cfg, "tau_start", 1.0),
         "tau_end": pick(args, cfg, "tau_end", 0.1),
         "tau_decay_epochs": pick(args, cfg, "tau_decay_epochs", 50),
+        "ndcg_temperature": pick(args, cfg, "ndcg_temperature", 1.0),
+        "ndcg_gain_power": pick(args, cfg, "ndcg_gain_power", 1.0),
+        "ndcg_max_pairs": pick(args, cfg, "ndcg_max_pairs", 50000),
+        "l2_lambda": pick(args, cfg, "l2_lambda", 0.0),
+        "l2_exclude_bias_norm": pick(args, cfg, "l2_exclude_bias_norm", True),
         "topk_metric_k": pick(args, cfg, "topk_metric_k", 20),
         "device": pick(args, cfg, "device", "auto"),
         "seed": pick(args, cfg, "seed", 42),
@@ -360,6 +370,11 @@ def main() -> None:
         tau_start=float(train_params["tau_start"]),
         tau_end=float(train_params["tau_end"]),
         tau_decay_epochs=int(train_params["tau_decay_epochs"]),
+        ndcg_temperature=float(train_params["ndcg_temperature"]),
+        ndcg_gain_power=float(train_params["ndcg_gain_power"]),
+        ndcg_max_pairs=train_params["ndcg_max_pairs"],
+        l2_lambda=float(train_params["l2_lambda"]),
+        l2_exclude_bias_norm=bool(train_params["l2_exclude_bias_norm"]),
         topk_metric_k=int(train_params["topk_metric_k"]),
         device=str(train_params["device"]),
         seed=int(train_params["seed"]),

@@ -99,6 +99,16 @@ class TrainConfig:
     pairwise_margin: float = 0.0
     pairwise_max_pairs: Optional[int] = 20000
 
+    # NDCG-style top-heavy pairwise loss.
+    ndcg_temperature: float = 1.0
+    ndcg_gain_power: float = 1.0
+    ndcg_max_pairs: Optional[int] = 50000
+
+    # Explicit L2 penalty. AdamW weight_decay is still decoupled optimizer
+    # regularization; this term is added to the training objective directly.
+    l2_lambda: float = 0.0
+    l2_exclude_bias_norm: bool = True
+
     topk_metric_k: int = 20
 
     device: str = "auto"
@@ -196,6 +206,9 @@ def build_loss_config(train_config: TrainConfig, epoch: int) -> rl.RankLossConfi
         temperature=tau,
         pairwise_margin=float(train_config.pairwise_margin),
         pairwise_max_pairs=train_config.pairwise_max_pairs,
+        ndcg_temperature=float(train_config.ndcg_temperature),
+        ndcg_gain_power=float(train_config.ndcg_gain_power),
+        ndcg_max_pairs=train_config.ndcg_max_pairs,
     )
 
 
@@ -206,6 +219,38 @@ def create_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.Optim
         lr=float(config.lr),
         weight_decay=float(config.weight_decay),
     )
+
+
+def l2_regularization_loss(
+    model: nn.Module,
+    exclude_bias_norm: bool = True,
+) -> torch.Tensor:
+    """
+    Explicit L2 penalty added to the loss.
+
+    By default, bias vectors and normalization parameters are excluded. This is
+    usually more stable for Transformer / GroupNorm / LayerNorm models.
+    """
+    penalty: Optional[torch.Tensor] = None
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if exclude_bias_norm:
+            lname = name.lower()
+            if lname.endswith(".bias") or "norm" in lname:
+                continue
+
+        term = param.float().pow(2).sum()
+        penalty = term if penalty is None else penalty + term
+
+    if penalty is None:
+        first = next(model.parameters())
+        return first.sum() * 0.0
+
+    return penalty
+
 
 
 def get_current_lr(optimizer: torch.optim.Optimizer) -> float:
@@ -453,6 +498,8 @@ def train_one_epoch(
     scaler = torch.amp.GradScaler("cuda") if use_amp and hasattr(torch, "amp") else None
 
     losses: list[float] = []
+    objective_losses: list[float] = []
+    l2_losses: list[float] = []
     rank_ics: list[float] = []
     ics: list[float] = []
     topk_rets: list[float] = []
@@ -469,7 +516,12 @@ def train_one_epoch(
         if use_amp:
             with torch.amp.autocast("cuda"):
                 scores = model(batch["x_ts"], batch["x_scalar"])
-                loss = rl.rank_loss(scores, batch["y"], config=loss_config)
+                rank_objective_loss = rl.rank_loss(scores, batch["y"], config=loss_config)
+                l2_loss = l2_regularization_loss(
+                    model,
+                    exclude_bias_norm=bool(train_config.l2_exclude_bias_norm),
+                )
+                loss = rank_objective_loss + float(train_config.l2_lambda) * l2_loss
 
             assert scaler is not None
             scaler.scale(loss).backward()
@@ -489,7 +541,12 @@ def train_one_epoch(
             scaler.update()
         else:
             scores = model(batch["x_ts"], batch["x_scalar"])
-            loss = rl.rank_loss(scores, batch["y"], config=loss_config)
+            rank_objective_loss = rl.rank_loss(scores, batch["y"], config=loss_config)
+            l2_loss = l2_regularization_loss(
+                model,
+                exclude_bias_norm=bool(train_config.l2_exclude_bias_norm),
+            )
+            loss = rank_objective_loss + float(train_config.l2_lambda) * l2_loss
             loss.backward()
 
             if train_config.grad_clip_norm is not None:
@@ -504,6 +561,8 @@ def train_one_epoch(
             optimizer.step()
 
         losses.append(float(loss.detach().cpu().item()))
+        objective_losses.append(float(rank_objective_loss.detach().cpu().item()))
+        l2_losses.append(float(l2_loss.detach().cpu().item()))
         if np.isfinite(grad_norm):
             grad_norms.append(float(grad_norm))
 
@@ -520,6 +579,9 @@ def train_one_epoch(
         # TensorBoard step-level logging.
         if train_config.tb_log_every_steps and global_step % int(train_config.tb_log_every_steps) == 0:
             tb_add_scalar(writer, "train_step/loss", float(loss.detach().cpu().item()), global_step)
+            tb_add_scalar(writer, "train_step/objective_loss", float(rank_objective_loss.detach().cpu().item()), global_step)
+            tb_add_scalar(writer, "train_step/l2_loss_raw", float(l2_loss.detach().cpu().item()), global_step)
+            tb_add_scalar(writer, "train_step/l2_loss_weighted", float(train_config.l2_lambda) * float(l2_loss.detach().cpu().item()), global_step)
             tb_add_scalar(writer, "train_step/rank_ic", metrics["rank_ic"], global_step)
             tb_add_scalar(writer, "train_step/ic", metrics["ic"], global_step)
             tb_add_scalar(writer, "train_step/topk_ret", metrics["topk_ret"], global_step)
@@ -547,6 +609,9 @@ def train_one_epoch(
 
     metrics_out = {
         "train_loss": _safe_mean(losses),
+        "train_objective_loss": _safe_mean(objective_losses),
+        "train_l2_loss_raw": _safe_mean(l2_losses),
+        "train_l2_loss_weighted": float(train_config.l2_lambda) * _safe_mean(l2_losses),
         "train_rank_ic": _safe_mean(rank_ics),
         "train_ic": _safe_mean(ics),
         "train_topk_ret": _safe_mean(topk_rets),

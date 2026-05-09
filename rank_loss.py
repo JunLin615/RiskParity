@@ -49,6 +49,11 @@ class RankLossConfig:
     pairwise_margin: float = 0.0
     pairwise_max_pairs: Optional[int] = None
 
+    # NDCG-style top-heavy pairwise loss options.
+    ndcg_temperature: float = 1.0
+    ndcg_gain_power: float = 1.0
+    ndcg_max_pairs: Optional[int] = None
+
 
 @dataclass(frozen=True)
 class TemperatureSchedule:
@@ -326,6 +331,119 @@ def pairwise_logistic_loss(
     return torch.stack(losses).mean()
 
 
+def _rank_positions_desc(values: torch.Tensor) -> torch.Tensor:
+    """
+    Return 1-based ordinal positions after sorting values descending.
+
+    Highest value gets position 1.
+    """
+    order = torch.argsort(values, descending=True)
+    positions = torch.empty_like(order, dtype=torch.float32)
+    positions[order] = torch.arange(1, values.numel() + 1, device=values.device, dtype=torch.float32)
+    return positions
+
+
+def ndcg_pairwise_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    temperature: float = 1.0,
+    gain_power: float = 1.0,
+    max_pairs: Optional[int] = None,
+    eps: float = EPS,
+) -> torch.Tensor:
+    """
+    NDCG-style top-heavy pairwise logistic loss.
+
+    Motivation
+    ----------
+    The strategy cares much more about the top-ranked stocks than the whole
+    cross-section. This loss keeps the differentiable pairwise logistic form but
+    weights pairs by a target-side NDCG-like discount:
+
+        high true-rank item at ideal position 1 receives the largest weight;
+        lower true-rank items receive smaller weights according to
+        1 / log2(position + 1).
+
+    For each pair where target_i > target_j, encourage:
+
+        pred_i > pred_j
+
+    Loss per pair:
+        weight_ij * softplus(-(pred_i - pred_j) / temperature)
+
+    Notes
+    -----
+    This is differentiable w.r.t. pred. The neural network training problem is
+    still non-convex, but the per-pair logistic surrogate is smooth and stable.
+    """
+    p, _ = _ensure_2d(pred)
+    t, _ = _ensure_2d(target)
+
+    if p.shape != t.shape:
+        raise ValueError(f"pred and target shape mismatch: {tuple(p.shape)} vs {tuple(t.shape)}")
+
+    if mask is not None:
+        m, _ = _ensure_2d(mask.bool())
+    else:
+        m = make_valid_mask(p, t)
+
+    tau = max(float(temperature), eps)
+    gain_power = max(float(gain_power), eps)
+
+    losses = []
+
+    for b in range(p.shape[0]):
+        valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(t[b])
+        pb = p[b, valid].float()
+        tb = t[b, valid].float()
+
+        n = pb.numel()
+        if n < 2:
+            continue
+
+        # Convert arbitrary target values to rank-percentile-like relevance in [0, 1].
+        # This makes the loss robust for target_mode=rank_pct, rank_centered,
+        # zscore, or raw returns.
+        target_pos = _rank_positions_desc(tb)  # top target -> 1
+        rel = 1.0 - (target_pos - 1.0) / max(float(n - 1), 1.0)
+        rel = rel.clamp(0.0, 1.0)
+
+        # NDCG-like gain and ideal discount.
+        gain = torch.pow(torch.tensor(2.0, device=pb.device), gain_power * rel) - 1.0
+        discount = 1.0 / torch.log2(target_pos + 1.0)
+
+        # Pair i,j: if target_i > target_j, i should be ranked above j.
+        target_diff = tb.unsqueeze(1) - tb.unsqueeze(0)
+        pair_mask = target_diff > 0
+
+        if not pair_mask.any():
+            continue
+
+        pred_diff = pb.unsqueeze(1) - pb.unsqueeze(0)
+
+        gain_diff = (gain.unsqueeze(1) - gain.unsqueeze(0)).abs()
+        # Emphasize pairs whose better member should be near the top.
+        top_discount = torch.maximum(discount.unsqueeze(1), discount.unsqueeze(0))
+        pair_weight = gain_diff * top_discount
+        pair_weight = pair_weight[pair_mask].clamp_min(eps)
+
+        pair_losses = F.softplus(-pred_diff[pair_mask] / tau)
+        weighted = pair_losses * pair_weight
+
+        if max_pairs is not None and weighted.numel() > int(max_pairs):
+            idx = torch.randperm(weighted.numel(), device=weighted.device)[: int(max_pairs)]
+            weighted = weighted[idx]
+            pair_weight = pair_weight[idx]
+
+        losses.append(weighted.sum() / pair_weight.sum().clamp_min(eps))
+
+    if not losses:
+        return pred.sum() * 0.0
+
+    return torch.stack(losses).mean()
+
+
 def rank_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -358,6 +476,17 @@ def rank_loss(
             eps=config.eps,
         )
 
+    if loss_type in {"ndcg", "ndcg_pairwise", "topheavy_pairwise"}:
+        return ndcg_pairwise_loss(
+            pred,
+            target,
+            mask=mask,
+            temperature=config.ndcg_temperature,
+            gain_power=config.ndcg_gain_power,
+            max_pairs=config.ndcg_max_pairs,
+            eps=config.eps,
+        )
+
     raise ValueError(f"unsupported loss_type: {config.loss_type!r}")
 
 
@@ -372,16 +501,9 @@ def rank_ic(
     mask: Optional[torch.Tensor] = None,
     eps: float = EPS,
 ) -> torch.Tensor:
-    """
-    Spearman-like RankIC using hard ranks, returned per batch item.
-
-    Important:
-        This metric always uses float32 internally. Under AMP, model scores may
-        be float16. Hard ranks can be as large as N=512, and their squared
-        deviations can overflow in float16 when computing correlation.
-    """
-    p, was_1d = _ensure_2d(pred.detach().float())
-    t, _ = _ensure_2d(target.detach().float())
+    """Spearman-like RankIC using hard ranks, returned per batch item."""
+    p, was_1d = _ensure_2d(pred)
+    t, _ = _ensure_2d(target)
 
     if mask is not None:
         m, _ = _ensure_2d(mask.bool())
@@ -393,18 +515,12 @@ def rank_ic(
     for b in range(p.shape[0]):
         valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(t[b])
         if valid.sum() < 2:
-            out.append(torch.tensor(0.0, device=p.device, dtype=torch.float32))
+            out.append(torch.tensor(0.0, device=p.device, dtype=p.dtype))
             continue
 
-        pb = p[b, valid]
-        tb = t[b, valid]
-
-        # Hard ordinal ranks. This is sufficient for monitoring RankIC.
-        # The tensors are float32 to avoid fp16 overflow in variance/covariance.
-        pr = torch.argsort(torch.argsort(pb)).float()
-        tr = torch.argsort(torch.argsort(tb)).float()
-
-        corr = masked_pearson_corr(pr, tr, eps=eps).float()
+        pr = torch.argsort(torch.argsort(p[b, valid].float())).to(dtype=p.dtype)
+        tr = torch.argsort(torch.argsort(t[b, valid].float())).to(dtype=p.dtype)
+        corr = masked_pearson_corr(pr, tr, eps=eps)
         out.append(corr)
 
     result = torch.stack(out)
@@ -465,6 +581,7 @@ __all__ = [
     "rank_to_pct",
     "spearman_soft_rank_loss",
     "pairwise_logistic_loss",
+    "ndcg_pairwise_loss",
     "rank_loss",
     "rank_ic",
     "information_coefficient",
