@@ -459,12 +459,26 @@ def compute_batch_metrics(
 
     rank_ic = rl.rank_ic(scores_f, y_f).detach().float().mean().item()
     ic = rl.information_coefficient(scores_f, y_raw_f).detach().float().mean().item()
+
     topk_ret = rl.topk_mean_return(scores_f, y_raw_f, k=int(topk)).detach().float().mean().item()
+    topk_excess_ret = rl.topk_excess_return(scores_f, y_raw_f, k=int(topk)).detach().float().mean().item()
+    long_short_spread = rl.long_short_spread_return(scores_f, y_raw_f, k=int(topk)).detach().float().mean().item()
+
+    topk_hit = rl.topk_hit_rate(scores_f, y_f, k=int(topk)).detach().float().mean().item()
+    ndcg_k = rl.ndcg_at_k(scores_f, y_f, k=int(topk)).detach().float().mean().item()
+    topk_rank_mean = rl.topk_true_rank_mean(scores_f, y_f, k=int(topk)).detach().float().mean().item()
+    topk_rank_score = rl.topk_true_rank_normalized_score(scores_f, y_f, k=int(topk)).detach().float().mean().item()
 
     return {
         "rank_ic": float(rank_ic),
         "ic": float(ic),
         "topk_ret": float(topk_ret),
+        "topk_excess_ret": float(topk_excess_ret),
+        "long_short_spread": float(long_short_spread),
+        "topk_hit_rate": float(topk_hit),
+        "ndcg_at_k": float(ndcg_k),
+        "topk_true_rank_mean": float(topk_rank_mean),
+        "topk_true_rank_score": float(topk_rank_score),
     }
 
 
@@ -503,6 +517,12 @@ def train_one_epoch(
     rank_ics: list[float] = []
     ics: list[float] = []
     topk_rets: list[float] = []
+    topk_excess_rets: list[float] = []
+    long_short_spreads: list[float] = []
+    topk_hit_rates: list[float] = []
+    ndcg_at_ks: list[float] = []
+    topk_true_rank_means: list[float] = []
+    topk_true_rank_scores: list[float] = []
     grad_norms: list[float] = []
 
     for step, batch in enumerate(loader, start=1):
@@ -575,6 +595,12 @@ def train_one_epoch(
         rank_ics.append(metrics["rank_ic"])
         ics.append(metrics["ic"])
         topk_rets.append(metrics["topk_ret"])
+        topk_excess_rets.append(metrics["topk_excess_ret"])
+        long_short_spreads.append(metrics["long_short_spread"])
+        topk_hit_rates.append(metrics["topk_hit_rate"])
+        ndcg_at_ks.append(metrics["ndcg_at_k"])
+        topk_true_rank_means.append(metrics["topk_true_rank_mean"])
+        topk_true_rank_scores.append(metrics["topk_true_rank_score"])
 
         # TensorBoard step-level logging.
         if train_config.tb_log_every_steps and global_step % int(train_config.tb_log_every_steps) == 0:
@@ -585,6 +611,12 @@ def train_one_epoch(
             tb_add_scalar(writer, "train_step/rank_ic", metrics["rank_ic"], global_step)
             tb_add_scalar(writer, "train_step/ic", metrics["ic"], global_step)
             tb_add_scalar(writer, "train_step/topk_ret", metrics["topk_ret"], global_step)
+            tb_add_scalar(writer, "train_step/topk_excess_ret", metrics["topk_excess_ret"], global_step)
+            tb_add_scalar(writer, "train_step/long_short_spread", metrics["long_short_spread"], global_step)
+            tb_add_scalar(writer, "train_step/topk_hit_rate", metrics["topk_hit_rate"], global_step)
+            tb_add_scalar(writer, "train_step/ndcg_at_k", metrics["ndcg_at_k"], global_step)
+            tb_add_scalar(writer, "train_step/topk_true_rank_mean", metrics["topk_true_rank_mean"], global_step)
+            tb_add_scalar(writer, "train_step/topk_true_rank_score", metrics["topk_true_rank_score"], global_step)
             tb_add_scalar(writer, "train_step/temperature", loss_config.temperature, global_step)
             tb_add_scalar(writer, "train_step/lr", get_current_lr(optimizer), global_step)
             tb_add_scalar(writer, "train_step/seconds_per_step", time.perf_counter() - step_start, global_step)
@@ -615,6 +647,12 @@ def train_one_epoch(
         "train_rank_ic": _safe_mean(rank_ics),
         "train_ic": _safe_mean(ics),
         "train_topk_ret": _safe_mean(topk_rets),
+        "train_topk_excess_ret": _safe_mean(topk_excess_rets),
+        "train_long_short_spread": _safe_mean(long_short_spreads),
+        "train_topk_hit_rate": _safe_mean(topk_hit_rates),
+        "train_ndcg_at_k": _safe_mean(ndcg_at_ks),
+        "train_topk_true_rank_mean": _safe_mean(topk_true_rank_means),
+        "train_topk_true_rank_score": _safe_mean(topk_true_rank_scores),
         "train_grad_norm": _safe_mean(grad_norms),
         "train_epoch_seconds": float(elapsed),
         "train_steps_per_second": float(len(loader) / elapsed) if elapsed > 0 else float("nan"),
@@ -650,6 +688,12 @@ def validate_one_epoch(
     rank_ics: list[float] = []
     ics: list[float] = []
     topk_rets: list[float] = []
+    topk_excess_rets: list[float] = []
+    long_short_spreads: list[float] = []
+    topk_hit_rates: list[float] = []
+    ndcg_at_ks: list[float] = []
+    topk_true_rank_means: list[float] = []
+    topk_true_rank_scores: list[float] = []
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -667,6 +711,12 @@ def validate_one_epoch(
         rank_ics.append(metrics["rank_ic"])
         ics.append(metrics["ic"])
         topk_rets.append(metrics["topk_ret"])
+        topk_excess_rets.append(metrics["topk_excess_ret"])
+        long_short_spreads.append(metrics["long_short_spread"])
+        topk_hit_rates.append(metrics["topk_hit_rate"])
+        ndcg_at_ks.append(metrics["ndcg_at_k"])
+        topk_true_rank_means.append(metrics["topk_true_rank_mean"])
+        topk_true_rank_scores.append(metrics["topk_true_rank_score"])
 
     elapsed = time.perf_counter() - val_start
     out = {
@@ -674,6 +724,12 @@ def validate_one_epoch(
         "valid_rank_ic": _safe_mean(rank_ics),
         "valid_ic": _safe_mean(ics),
         "valid_topk_ret": _safe_mean(topk_rets),
+        "valid_topk_excess_ret": _safe_mean(topk_excess_rets),
+        "valid_long_short_spread": _safe_mean(long_short_spreads),
+        "valid_topk_hit_rate": _safe_mean(topk_hit_rates),
+        "valid_ndcg_at_k": _safe_mean(ndcg_at_ks),
+        "valid_topk_true_rank_mean": _safe_mean(topk_true_rank_means),
+        "valid_topk_true_rank_score": _safe_mean(topk_true_rank_scores),
         "valid_epoch_seconds": float(elapsed),
         "valid_steps_per_second": float(len(loader) / elapsed) if elapsed > 0 else float("nan"),
         "temperature": float(loss_config.temperature),
@@ -981,6 +1037,9 @@ def fit_model(
             f"valid_rank_ic={row.get('valid_rank_ic', float('nan')):.4f} "
             f"valid_ic={row.get('valid_ic', float('nan')):.4f} "
             f"valid_topk_ret={row.get('valid_topk_ret', float('nan')):.6f} "
+            f"valid_hit@k={row.get('valid_topk_hit_rate', float('nan')):.3f} "
+            f"valid_ndcg@k={row.get('valid_ndcg_at_k', float('nan')):.3f} "
+            f"valid_rankmean@k={row.get('valid_topk_true_rank_mean', float('nan')):.1f} "
             f"gpu_max_alloc={row.get('gpu_max_allocated_mb', float('nan')):.0f}MB "
             f"tau={row.get('temperature', float('nan')):.4f}"
         )

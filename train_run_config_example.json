@@ -34,9 +34,9 @@
   "label_valid_name": "label_valid_t1_t6",
   "target_mode": "rank_pct",
   "model_preset": "small",
-  "max_epochs": 10,
-  "batch_size": 4,
-  "lr": 0.0001,
+  "max_epochs": 1000,
+  "batch_size": 3,
+  "lr": 1e-4,
   "loss_type": "ndcg_pairwise",
   "use_amp": true,
   "checkpoint_dir": "checkpoints/dual_transformer_ranker",
@@ -54,7 +54,7 @@
   "topk_metric_k": 20,
   "device": "auto",
   "seed": 42,
-  "early_stopping_patience": 10,
+  "early_stopping_patience": 500,
   "log_every_steps": 0,
   "use_tensorboard": true,
   "tensorboard_dirname": "tensorboard",
@@ -70,5 +70,7 @@
   "ndcg_max_pairs": 50000,
   "l2_lambda": 1e-06,
   "l2_exclude_bias_norm": true,
-  "dropout": 0.4
+  "dropout": 0.4,
+  "metric_for_best": "valid_topk_true_rank_mean",
+  "maximize_metric": false
 }

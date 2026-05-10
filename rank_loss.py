@@ -501,9 +501,13 @@ def rank_ic(
     mask: Optional[torch.Tensor] = None,
     eps: float = EPS,
 ) -> torch.Tensor:
-    """Spearman-like RankIC using hard ranks, returned per batch item."""
-    p, was_1d = _ensure_2d(pred)
-    t, _ = _ensure_2d(target)
+    """
+    Spearman-like RankIC using hard ranks, returned per batch item.
+
+    Uses float32 internally to avoid fp16 overflow under AMP.
+    """
+    p, was_1d = _ensure_2d(pred.detach().float())
+    t, _ = _ensure_2d(target.detach().float())
 
     if mask is not None:
         m, _ = _ensure_2d(mask.bool())
@@ -515,12 +519,12 @@ def rank_ic(
     for b in range(p.shape[0]):
         valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(t[b])
         if valid.sum() < 2:
-            out.append(torch.tensor(0.0, device=p.device, dtype=p.dtype))
+            out.append(torch.tensor(0.0, device=p.device, dtype=torch.float32))
             continue
 
-        pr = torch.argsort(torch.argsort(p[b, valid].float())).to(dtype=p.dtype)
-        tr = torch.argsort(torch.argsort(t[b, valid].float())).to(dtype=p.dtype)
-        corr = masked_pearson_corr(pr, tr, eps=eps)
+        pr = torch.argsort(torch.argsort(p[b, valid])).float()
+        tr = torch.argsort(torch.argsort(t[b, valid])).float()
+        corr = masked_pearson_corr(pr, tr, eps=eps).float()
         out.append(corr)
 
     result = torch.stack(out)
@@ -570,6 +574,281 @@ def topk_mean_return(
     return _restore_dim(result, was_1d)
 
 
+@torch.no_grad()
+def topk_excess_return(
+    pred: torch.Tensor,
+    forward_return: torch.Tensor,
+    k: int = 20,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Top-k mean return minus full valid-universe mean return."""
+    p, was_1d = _ensure_2d(pred.detach().float())
+    r, _ = _ensure_2d(forward_return.detach().float())
+
+    if mask is not None:
+        m, _ = _ensure_2d(mask.bool())
+    else:
+        m = make_valid_mask(p, r)
+
+    vals = []
+    for b in range(p.shape[0]):
+        valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(r[b])
+        if valid.sum() == 0:
+            vals.append(torch.tensor(0.0, device=p.device, dtype=torch.float32))
+            continue
+
+        kk = min(int(k), int(valid.sum().item()))
+        valid_scores = p[b, valid]
+        valid_returns = r[b, valid]
+        idx = torch.topk(valid_scores, k=kk, largest=True).indices
+        vals.append(valid_returns[idx].mean() - valid_returns.mean())
+
+    result = torch.stack(vals)
+    return _restore_dim(result, was_1d)
+
+
+@torch.no_grad()
+def long_short_spread_return(
+    pred: torch.Tensor,
+    forward_return: torch.Tensor,
+    k: int = 20,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Top-k predicted mean return minus bottom-k predicted mean return."""
+    p, was_1d = _ensure_2d(pred.detach().float())
+    r, _ = _ensure_2d(forward_return.detach().float())
+
+    if mask is not None:
+        m, _ = _ensure_2d(mask.bool())
+    else:
+        m = make_valid_mask(p, r)
+
+    vals = []
+    for b in range(p.shape[0]):
+        valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(r[b])
+        if valid.sum() < 2:
+            vals.append(torch.tensor(0.0, device=p.device, dtype=torch.float32))
+            continue
+
+        kk = min(int(k), int(valid.sum().item()) // 2)
+        if kk <= 0:
+            vals.append(torch.tensor(0.0, device=p.device, dtype=torch.float32))
+            continue
+
+        valid_scores = p[b, valid]
+        valid_returns = r[b, valid]
+        top_idx = torch.topk(valid_scores, k=kk, largest=True).indices
+        bot_idx = torch.topk(valid_scores, k=kk, largest=False).indices
+        vals.append(valid_returns[top_idx].mean() - valid_returns[bot_idx].mean())
+
+    result = torch.stack(vals)
+    return _restore_dim(result, was_1d)
+
+
+@torch.no_grad()
+def topk_hit_rate(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    k: int = 20,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Predicted Top-K and true Top-K overlap ratio.
+
+    Formula:
+        hit_rate@K = |PredTopK intersection TrueTopK| / K
+
+    Since both sets have size K, this is also Precision@K and Recall@K.
+    """
+    p, was_1d = _ensure_2d(pred.detach().float())
+    t, _ = _ensure_2d(target.detach().float())
+
+    if mask is not None:
+        m, _ = _ensure_2d(mask.bool())
+    else:
+        m = make_valid_mask(p, t)
+
+    vals = []
+    for b in range(p.shape[0]):
+        valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(t[b])
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            vals.append(torch.tensor(0.0, device=p.device, dtype=torch.float32))
+            continue
+
+        kk = min(int(k), n_valid)
+        valid_scores = p[b, valid]
+        valid_target = t[b, valid]
+
+        pred_idx = torch.topk(valid_scores, k=kk, largest=True).indices
+        true_idx = torch.topk(valid_target, k=kk, largest=True).indices
+
+        pred_mask = torch.zeros(n_valid, dtype=torch.bool, device=p.device)
+        true_mask = torch.zeros(n_valid, dtype=torch.bool, device=p.device)
+        pred_mask[pred_idx] = True
+        true_mask[true_idx] = True
+
+        hit = (pred_mask & true_mask).sum().float() / float(kk)
+        vals.append(hit)
+
+    result = torch.stack(vals)
+    return _restore_dim(result, was_1d)
+
+
+@torch.no_grad()
+def ndcg_at_k(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    k: int = 20,
+    mask: Optional[torch.Tensor] = None,
+    gain_power: float = 1.0,
+    eps: float = EPS,
+) -> torch.Tensor:
+    """
+    NDCG@K computed from target-side relevance.
+
+    This is a monitoring metric, not the training loss. It is robust to target
+    scale by converting target values to rank-percentile relevance inside each
+    cross-section.
+    """
+    p, was_1d = _ensure_2d(pred.detach().float())
+    t, _ = _ensure_2d(target.detach().float())
+
+    if mask is not None:
+        m, _ = _ensure_2d(mask.bool())
+    else:
+        m = make_valid_mask(p, t)
+
+    vals = []
+    gain_power = max(float(gain_power), eps)
+
+    for b in range(p.shape[0]):
+        valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(t[b])
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            vals.append(torch.tensor(0.0, device=p.device, dtype=torch.float32))
+            continue
+
+        kk = min(int(k), n_valid)
+        valid_scores = p[b, valid]
+        valid_target = t[b, valid]
+
+        target_pos = _rank_positions_desc(valid_target)
+        if n_valid > 1:
+            rel = 1.0 - (target_pos - 1.0) / float(n_valid - 1)
+        else:
+            rel = torch.ones_like(target_pos)
+        rel = rel.clamp(0.0, 1.0)
+
+        gains = torch.pow(torch.tensor(2.0, device=p.device), gain_power * rel) - 1.0
+        discounts = 1.0 / torch.log2(torch.arange(2, kk + 2, device=p.device, dtype=torch.float32))
+
+        pred_idx = torch.topk(valid_scores, k=kk, largest=True).indices
+        ideal_idx = torch.topk(valid_target, k=kk, largest=True).indices
+
+        dcg = (gains[pred_idx] * discounts).sum()
+        idcg = (gains[ideal_idx] * discounts).sum().clamp_min(eps)
+        vals.append(dcg / idcg)
+
+    result = torch.stack(vals)
+    return _restore_dim(result, was_1d)
+
+
+@torch.no_grad()
+def topk_true_rank_mean(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    k: int = 20,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Mean true rank position of predicted Top-K names.
+
+    Rank convention:
+        true best stock has rank position 1.
+        true worst stock has rank position N.
+
+    For K=20:
+        ideal value is (1 + 20) / 2 = 10.5.
+        random expectation is approximately (N + 1) / 2.
+
+    Lower is better.
+    """
+    p, was_1d = _ensure_2d(pred.detach().float())
+    t, _ = _ensure_2d(target.detach().float())
+
+    if mask is not None:
+        m, _ = _ensure_2d(mask.bool())
+    else:
+        m = make_valid_mask(p, t)
+
+    vals = []
+    for b in range(p.shape[0]):
+        valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(t[b])
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            vals.append(torch.tensor(float("nan"), device=p.device, dtype=torch.float32))
+            continue
+
+        kk = min(int(k), n_valid)
+        valid_scores = p[b, valid]
+        valid_target = t[b, valid]
+
+        true_rank_pos = _rank_positions_desc(valid_target)  # best target -> 1
+        pred_top_idx = torch.topk(valid_scores, k=kk, largest=True).indices
+        vals.append(true_rank_pos[pred_top_idx].mean())
+
+    result = torch.stack(vals)
+    return _restore_dim(result, was_1d)
+
+
+@torch.no_grad()
+def topk_true_rank_normalized_score(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    k: int = 20,
+    mask: Optional[torch.Tensor] = None,
+    eps: float = EPS,
+) -> torch.Tensor:
+    """
+    Normalize topk_true_rank_mean to an interpretable score.
+
+    Score convention:
+        1.0 = ideal predicted Top-K are exactly true Top-K.
+        0.0 = random expectation.
+        <0  = worse than random.
+
+    This is useful for dashboards. Higher is better.
+    """
+    p, was_1d = _ensure_2d(pred.detach().float())
+    t, _ = _ensure_2d(target.detach().float())
+
+    if mask is not None:
+        m, _ = _ensure_2d(mask.bool())
+    else:
+        m = make_valid_mask(p, t)
+
+    vals = []
+    for b in range(p.shape[0]):
+        valid = m[b] & torch.isfinite(p[b]) & torch.isfinite(t[b])
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            vals.append(torch.tensor(float("nan"), device=p.device, dtype=torch.float32))
+            continue
+
+        kk = min(int(k), n_valid)
+        rank_mean = topk_true_rank_mean(p[b], t[b], k=kk, mask=valid).float()
+
+        ideal = (1.0 + float(kk)) / 2.0
+        random_mean = (1.0 + float(n_valid)) / 2.0
+        denom = max(random_mean - ideal, eps)
+        score = (random_mean - rank_mean) / denom
+        vals.append(score)
+
+    result = torch.stack(vals)
+    return _restore_dim(result, was_1d)
+
+
 __all__ = [
     "EPS",
     "RankLossConfig",
@@ -586,4 +865,10 @@ __all__ = [
     "rank_ic",
     "information_coefficient",
     "topk_mean_return",
+    "topk_excess_return",
+    "long_short_spread_return",
+    "topk_hit_rate",
+    "ndcg_at_k",
+    "topk_true_rank_mean",
+    "topk_true_rank_normalized_score",
 ]
