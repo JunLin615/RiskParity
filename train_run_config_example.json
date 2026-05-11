@@ -35,8 +35,8 @@
   "target_mode": "rank_pct",
   "model_preset": "small",
   "max_epochs": 1000,
-  "batch_size": 3,
-  "lr": 1e-4,
+  "batch_size": 32,
+  "lr": 1e-3,
   "loss_type": "ndcg_pairwise",
   "use_amp": true,
   "checkpoint_dir": "checkpoints/dual_transformer_ranker",
@@ -70,7 +70,7 @@
   "ndcg_max_pairs": 50000,
   "l2_lambda": 1e-06,
   "l2_exclude_bias_norm": true,
-  "dropout": 0.4,
+  "dropout": 0.25,
   "metric_for_best": "valid_topk_true_rank_mean",
   "maximize_metric": false
 }
