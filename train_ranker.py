@@ -469,6 +469,14 @@ def compute_batch_metrics(
     topk_rank_mean = rl.topk_true_rank_mean(scores_f, y_f, k=int(topk)).detach().float().mean().item()
     topk_rank_score = rl.topk_true_rank_normalized_score(scores_f, y_f, k=int(topk)).detach().float().mean().item()
 
+    # Score distribution diagnostics.
+    # If score_std and score_range are near zero on validation, the model is
+    # giving almost identical scores to every stock in the cross-section.
+    score_std = scores_f.std(dim=-1, unbiased=False).mean().item()
+    score_range = (scores_f.max(dim=-1).values - scores_f.min(dim=-1).values).mean().item()
+    score_abs_mean = scores_f.abs().mean().item()
+    score_mean = scores_f.mean().item()
+
     return {
         "rank_ic": float(rank_ic),
         "ic": float(ic),
@@ -479,6 +487,10 @@ def compute_batch_metrics(
         "ndcg_at_k": float(ndcg_k),
         "topk_true_rank_mean": float(topk_rank_mean),
         "topk_true_rank_score": float(topk_rank_score),
+        "score_std": float(score_std),
+        "score_range": float(score_range),
+        "score_abs_mean": float(score_abs_mean),
+        "score_mean": float(score_mean),
     }
 
 
@@ -523,6 +535,10 @@ def train_one_epoch(
     ndcg_at_ks: list[float] = []
     topk_true_rank_means: list[float] = []
     topk_true_rank_scores: list[float] = []
+    score_stds: list[float] = []
+    score_ranges: list[float] = []
+    score_abs_means: list[float] = []
+    score_means: list[float] = []
     grad_norms: list[float] = []
 
     for step, batch in enumerate(loader, start=1):
@@ -601,6 +617,10 @@ def train_one_epoch(
         ndcg_at_ks.append(metrics["ndcg_at_k"])
         topk_true_rank_means.append(metrics["topk_true_rank_mean"])
         topk_true_rank_scores.append(metrics["topk_true_rank_score"])
+        score_stds.append(metrics["score_std"])
+        score_ranges.append(metrics["score_range"])
+        score_abs_means.append(metrics["score_abs_mean"])
+        score_means.append(metrics["score_mean"])
 
         # TensorBoard step-level logging.
         if train_config.tb_log_every_steps and global_step % int(train_config.tb_log_every_steps) == 0:
@@ -617,6 +637,10 @@ def train_one_epoch(
             tb_add_scalar(writer, "train_step/ndcg_at_k", metrics["ndcg_at_k"], global_step)
             tb_add_scalar(writer, "train_step/topk_true_rank_mean", metrics["topk_true_rank_mean"], global_step)
             tb_add_scalar(writer, "train_step/topk_true_rank_score", metrics["topk_true_rank_score"], global_step)
+            tb_add_scalar(writer, "train_step/score_std", metrics["score_std"], global_step)
+            tb_add_scalar(writer, "train_step/score_range", metrics["score_range"], global_step)
+            tb_add_scalar(writer, "train_step/score_abs_mean", metrics["score_abs_mean"], global_step)
+            tb_add_scalar(writer, "train_step/score_mean", metrics["score_mean"], global_step)
             tb_add_scalar(writer, "train_step/temperature", loss_config.temperature, global_step)
             tb_add_scalar(writer, "train_step/lr", get_current_lr(optimizer), global_step)
             tb_add_scalar(writer, "train_step/seconds_per_step", time.perf_counter() - step_start, global_step)
@@ -653,6 +677,10 @@ def train_one_epoch(
         "train_ndcg_at_k": _safe_mean(ndcg_at_ks),
         "train_topk_true_rank_mean": _safe_mean(topk_true_rank_means),
         "train_topk_true_rank_score": _safe_mean(topk_true_rank_scores),
+        "train_score_std": _safe_mean(score_stds),
+        "train_score_range": _safe_mean(score_ranges),
+        "train_score_abs_mean": _safe_mean(score_abs_means),
+        "train_score_mean": _safe_mean(score_means),
         "train_grad_norm": _safe_mean(grad_norms),
         "train_epoch_seconds": float(elapsed),
         "train_steps_per_second": float(len(loader) / elapsed) if elapsed > 0 else float("nan"),
@@ -694,6 +722,10 @@ def validate_one_epoch(
     ndcg_at_ks: list[float] = []
     topk_true_rank_means: list[float] = []
     topk_true_rank_scores: list[float] = []
+    score_stds: list[float] = []
+    score_ranges: list[float] = []
+    score_abs_means: list[float] = []
+    score_means: list[float] = []
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -717,6 +749,10 @@ def validate_one_epoch(
         ndcg_at_ks.append(metrics["ndcg_at_k"])
         topk_true_rank_means.append(metrics["topk_true_rank_mean"])
         topk_true_rank_scores.append(metrics["topk_true_rank_score"])
+        score_stds.append(metrics["score_std"])
+        score_ranges.append(metrics["score_range"])
+        score_abs_means.append(metrics["score_abs_mean"])
+        score_means.append(metrics["score_mean"])
 
     elapsed = time.perf_counter() - val_start
     out = {
@@ -730,6 +766,10 @@ def validate_one_epoch(
         "valid_ndcg_at_k": _safe_mean(ndcg_at_ks),
         "valid_topk_true_rank_mean": _safe_mean(topk_true_rank_means),
         "valid_topk_true_rank_score": _safe_mean(topk_true_rank_scores),
+        "valid_score_std": _safe_mean(score_stds),
+        "valid_score_range": _safe_mean(score_ranges),
+        "valid_score_abs_mean": _safe_mean(score_abs_means),
+        "valid_score_mean": _safe_mean(score_means),
         "valid_epoch_seconds": float(elapsed),
         "valid_steps_per_second": float(len(loader) / elapsed) if elapsed > 0 else float("nan"),
         "temperature": float(loss_config.temperature),
@@ -1040,6 +1080,7 @@ def fit_model(
             f"valid_hit@k={row.get('valid_topk_hit_rate', float('nan')):.3f} "
             f"valid_ndcg@k={row.get('valid_ndcg_at_k', float('nan')):.3f} "
             f"valid_rankmean@k={row.get('valid_topk_true_rank_mean', float('nan')):.1f} "
+            f"valid_score_std={row.get('valid_score_std', float('nan')):.4g} "
             f"gpu_max_alloc={row.get('gpu_max_allocated_mb', float('nan')):.0f}MB "
             f"tau={row.get('temperature', float('nan')):.4f}"
         )

@@ -130,17 +130,46 @@ def model_preset_kwargs(preset: str) -> dict[str, Any]:
 def override_model_kwargs(base: dict[str, Any], args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Any]:
     """Override preset model kwargs with explicit CLI/JSON values."""
     model_keys = [
-        "temporal_channels",
+        # V7 temporal encoder
+        "depthwise_layers",
+        "depthwise_kernel_size",
         "temporal_compressed_len",
-        "model_dim",
+        "mixed_channels_1",
+        "mixed_channels_2",
+        "temporal_out_channels",
+        "mixed_kernel_size",
+        "group_norm_groups",
+
+        # activation / dropout
+        "activation",
+        "dropout",
+
+        # intra-stock attention
         "factor_num_layers",
         "factor_num_heads",
         "factor_ff_dim",
-        "cross_num_layers",
+        "factor_reduce_tokens",
+        "factor_use_positional_encoding",
+
+        # V7 anti-collapse controls
+        "factor_self_output_norm",
+        "reduce_residual_pool",
+        "reduce_residual_gate_init",
+        "reduce_residual_projection",
+
+        # stock aggregation-broadcast
+        "stock_aggregate_tokens",
         "cross_num_heads",
         "cross_ff_dim",
+        "aggregate_residual_query",
+        "broadcast_residual_query",
+
+        # scalar switch
+        "use_scalar_factors",
+
+        # score head
         "score_hidden_dim",
-        "dropout",
+        "score_head_layers",
     ]
     out = dict(base)
     for key in model_keys:
